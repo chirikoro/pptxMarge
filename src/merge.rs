@@ -7,52 +7,12 @@ use crate::pptx;
 
 const SLIDE_REL_TYPE: &str =
     "http://schemas.openxmlformats.org/officeDocument/2006/relationships/slide";
-const MASTER_REL_TYPE: &str =
-    "http://schemas.openxmlformats.org/officeDocument/2006/relationships/slideMaster";
-
-/// Content-type map built from source file's [Content_Types].xml.
-/// Maps archive path (without leading /) -> content type string.
-struct ContentTypeMap {
-    overrides: HashMap<String, String>,
-    defaults: HashMap<String, String>,
-}
-
-impl ContentTypeMap {
-    fn from_archive(archive: &pptx::PptxArchive) -> Result<Self> {
-        if let Some(ct_xml) = archive.get("[Content_Types].xml") {
-            let (overrides, defaults) = pptx::parse_content_types(ct_xml)?;
-            Ok(Self { overrides, defaults })
-        } else {
-            Ok(Self {
-                overrides: HashMap::new(),
-                defaults: HashMap::new(),
-            })
-        }
-    }
-
-    /// Look up the content type for a given archive path (e.g. "ppt/slides/slide1.xml").
-    fn get(&self, archive_path: &str) -> Option<String> {
-        // Try Override first (with leading /)
-        let part_name = format!("/{}", archive_path);
-        if let Some(ct) = self.overrides.get(&part_name) {
-            return Some(ct.clone());
-        }
-        // Fall back to Default by extension
-        if let Some(ext) = archive_path.rsplit('.').next() {
-            if let Some(ct) = self.defaults.get(ext) {
-                return Some(ct.clone());
-            }
-        }
-        None
-    }
-
-    /// Look up content type for a source path, using the original path before renaming.
-    fn get_for_source(&self, src_path: &str) -> Option<String> {
-        self.get(src_path)
-    }
-}
+const SLIDE_CT: &str =
+    "application/vnd.openxmlformats-officedocument.presentationml.slide+xml";
 
 /// Merge multiple PPTX files into one output file.
+/// Simple strategy: keep base file's masters/layouts/themes,
+/// only copy slides and their direct resources (images etc).
 pub fn merge_pptx_files(input_files: &[impl AsRef<Path>], output: &Path) -> Result<()> {
     if input_files.len() < 2 {
         anyhow::bail!("結合するには2つ以上のファイルが必要です");
@@ -76,23 +36,29 @@ pub fn merge_pptx_files(input_files: &[impl AsRef<Path>], output: &Path) -> Resu
     let base_rels = pptx::parse_rels(&pres_rels_xml)?;
     let mut next_rid = pptx::max_rid(&base_rels) + 1;
 
-    // Master IDs and Layout IDs share the same ID space - must all be unique
-    // Find the max across both, then use that as the starting point for layout IDs
-    let max_master_id = parse_max_master_id(&pres_xml);
-    let max_layout_id = find_max_layout_id_in_archive(&archive);
-    let mut next_layout_id = std::cmp::max(max_master_id, max_layout_id) + 1;
-    // next_master_id will be set after layout IDs are assigned (see below)
+    let mut next_slide_num = find_max_number(&archive, "ppt/slides/", "slide", ".xml") + 1;
+    let mut next_media_num = find_max_media_number(&archive) + 1;
 
-    let mut counters = Counters {
-        slide: find_max_number(&archive, "ppt/slides/", "slide", ".xml") + 1,
-        layout: find_max_number(&archive, "ppt/slideLayouts/", "slideLayout", ".xml") + 1,
-        master: find_max_number(&archive, "ppt/slideMasters/", "slideMaster", ".xml") + 1,
-        theme: find_max_number(&archive, "ppt/theme/", "theme", ".xml") + 1,
-        media: find_max_media_number(&archive) + 1,
-        notes: find_max_number(&archive, "ppt/notesSlides/", "notesSlide", ".xml") + 1,
-        chart: find_max_number(&archive, "ppt/charts/", "chart", ".xml") + 1,
-    };
+    // Find the base file's first slide layout target (for imported slides)
+    let base_layout_target = find_base_layout_target(&archive);
 
+    // Merge Default extension entries from all source files
+    for file_path in &input_files[1..] {
+        let file_path = file_path.as_ref();
+        let src = pptx::read_pptx(file_path)
+            .with_context(|| format!("ファイルの読み込み失敗: {}", file_path.display()))?;
+
+        if let Some(ct_xml) = src.get("[Content_Types].xml") {
+            let (_, defaults) = pptx::parse_content_types(ct_xml)?;
+            for (ext, ct) in &defaults {
+                let dest_ct = archive.get("[Content_Types].xml").unwrap().clone();
+                let updated = pptx::add_content_type_default(&dest_ct, ext, ct)?;
+                archive.insert("[Content_Types].xml".to_string(), updated);
+            }
+        }
+    }
+
+    // Process each additional file
     for file_path in &input_files[1..] {
         let file_path = file_path.as_ref();
         let src = pptx::read_pptx(file_path)
@@ -112,91 +78,6 @@ pub fn merge_pptx_files(input_files: &[impl AsRef<Path>], output: &Path) -> Resu
             .map(|r| (r.id.clone(), r.target.clone()))
             .collect();
 
-        // Build content type map from source file
-        let src_ct = ContentTypeMap::from_archive(&src)?;
-
-        // Copy Default extension entries from source to destination
-        // (e.g. .emf, .wmf, .svg, .tiff that might not exist in base)
-        merge_default_extensions(&src_ct, &mut archive)?;
-
-        // === Phase 1: Build COMPLETE path_remap before copying anything ===
-        let mut path_remap: HashMap<String, String> = HashMap::new();
-
-        // Assign new names for themes
-        let src_themes: Vec<String> = sorted_keys(&src, "ppt/theme/", ".xml");
-        for src_path in &src_themes {
-            let new_path = format!("ppt/theme/theme{}.xml", counters.theme);
-            path_remap.insert(src_path.clone(), new_path);
-            counters.theme += 1;
-        }
-
-        // Assign new names for slideMasters
-        let src_masters: Vec<String> = sorted_keys(&src, "ppt/slideMasters/", ".xml");
-        for src_path in &src_masters {
-            let new_path = format!("ppt/slideMasters/slideMaster{}.xml", counters.master);
-            path_remap.insert(src_path.clone(), new_path);
-            counters.master += 1;
-        }
-
-        // Assign new names for slideLayouts
-        let src_layouts: Vec<String> = sorted_keys(&src, "ppt/slideLayouts/", ".xml");
-        for src_path in &src_layouts {
-            let new_path = format!("ppt/slideLayouts/slideLayout{}.xml", counters.layout);
-            path_remap.insert(src_path.clone(), new_path);
-            counters.layout += 1;
-        }
-
-        // Scan ALL .rels in src to find media/resources and assign new names
-        pre_scan_resources(&src, &mut path_remap, &mut counters)?;
-
-        // === Phase 2: Copy all files using the complete remap ===
-
-        // Copy themes
-        for src_path in &src_themes {
-            let new_path = path_remap.get(src_path).unwrap().clone();
-            copy_file_with_rels(&src, &mut archive, &src_ct, &path_remap, src_path, &new_path, "ppt/theme")?;
-            copy_content_type(&src_ct, src_path, &new_path, &mut archive)?;
-        }
-
-        // Copy slideMasters (rewrite layout IDs to avoid duplicates)
-        for src_path in &src_masters {
-            let new_path = path_remap.get(src_path).unwrap().clone();
-            copy_file_with_rels(&src, &mut archive, &src_ct, &path_remap, src_path, &new_path, "ppt/slideMasters")?;
-
-            // Rewrite sldLayoutId IDs in the copied master to be globally unique
-            let master_xml = archive.get(&new_path).unwrap().clone();
-            let rewritten = pptx::rewrite_layout_ids_in_master(&master_xml, &mut next_layout_id)?;
-            archive.insert(new_path.clone(), rewritten);
-
-            copy_content_type(&src_ct, src_path, &new_path, &mut archive)?;
-
-            // Register master in presentation.xml
-            // Use next_layout_id for master ID too (they share the same ID space)
-            let this_master_id = next_layout_id;
-            next_layout_id += 1;
-
-            let pres = archive.get("ppt/presentation.xml").unwrap().clone();
-            let rid_str = format!("rId{}", next_rid);
-            let updated_pres = pptx::add_master_to_presentation_xml(&pres, this_master_id, &rid_str)?;
-            archive.insert("ppt/presentation.xml".to_string(), updated_pres);
-
-            // Add relationship in presentation.xml.rels
-            let rels = archive.get("ppt/_rels/presentation.xml.rels").unwrap().clone();
-            let master_target = new_path.strip_prefix("ppt/").unwrap_or(&new_path);
-            let updated_rels = pptx::add_relationship_to_rels(&rels, &rid_str, MASTER_REL_TYPE, master_target)?;
-            archive.insert("ppt/_rels/presentation.xml.rels".to_string(), updated_rels);
-
-            next_rid += 1;
-        }
-
-        // Copy slideLayouts
-        for src_path in &src_layouts {
-            let new_path = path_remap.get(src_path).unwrap().clone();
-            copy_file_with_rels(&src, &mut archive, &src_ct, &path_remap, src_path, &new_path, "ppt/slideLayouts")?;
-            copy_content_type(&src_ct, src_path, &new_path, &mut archive)?;
-        }
-
-        // === Phase 3: Copy slides ===
         for slide_info in &src_slides {
             let src_slide_rel_target = match rid_to_target.get(&slide_info.r_id) {
                 Some(t) => t,
@@ -205,15 +86,84 @@ pub fn merge_pptx_files(input_files: &[impl AsRef<Path>], output: &Path) -> Resu
 
             let src_slide_path = normalize_ppt_path(src_slide_rel_target, "ppt");
 
-            if !src.contains_key(&src_slide_path) {
-                continue;
-            }
+            let slide_xml = match src.get(&src_slide_path) {
+                Some(data) => data.clone(),
+                None => continue,
+            };
 
-            let new_slide_path = format!("ppt/slides/slide{}.xml", counters.slide);
-            // Add to remap (in case other things reference this slide)
-            path_remap.insert(src_slide_path.clone(), new_slide_path.clone());
+            let new_slide_path = format!("ppt/slides/slide{}.xml", next_slide_num);
+            let new_slide_rels_path = format!("ppt/slides/_rels/slide{}.xml.rels", next_slide_num);
 
-            copy_file_with_rels(&src, &mut archive, &src_ct, &path_remap, &src_slide_path, &new_slide_path, "ppt/slides")?;
+            // Copy slide XML as-is
+            archive.insert(new_slide_path.clone(), slide_xml);
+
+            // Build new .rels for this slide: copy media/resources, use base layout
+            let src_slide_filename = src_slide_path.rsplit('/').next().unwrap_or("slide1.xml");
+            let src_slide_rels_path = format!("ppt/slides/_rels/{}.rels", src_slide_filename);
+
+            let new_rels = if let Some(rels_data) = src.get(&src_slide_rels_path) {
+                let rels = pptx::parse_rels(rels_data)?;
+                let mut entries: Vec<RelEntry> = Vec::new();
+
+                for rel in &rels {
+                    if rel.rel_type.ends_with("/slideLayout") {
+                        // Use base file's layout instead
+                        entries.push(RelEntry {
+                            id: rel.id.clone(),
+                            rel_type: rel.rel_type.clone(),
+                            target: base_layout_target.clone(),
+                            target_mode: None,
+                        });
+                    } else if rel.target_mode.as_deref() == Some("External")
+                        || rel.target.starts_with("http://")
+                        || rel.target.starts_with("https://")
+                    {
+                        // External link - keep as-is
+                        entries.push(RelEntry {
+                            id: rel.id.clone(),
+                            rel_type: rel.rel_type.clone(),
+                            target: rel.target.clone(),
+                            target_mode: rel.target_mode.clone(),
+                        });
+                    } else {
+                        // Media/resource - copy with new name
+                        let src_abs = resolve_path("ppt/slides", &rel.target);
+                        if let Some(data) = src.get(&src_abs) {
+                            let ext = src_abs.rsplit('.').next().unwrap_or("bin");
+                            let new_media = format!("ppt/media/media{}.{}", next_media_num, ext);
+                            let new_rel_target = format!("../media/media{}.{}", next_media_num, ext);
+                            next_media_num += 1;
+
+                            archive.insert(new_media, data.clone());
+                            entries.push(RelEntry {
+                                id: rel.id.clone(),
+                                rel_type: rel.rel_type.clone(),
+                                target: new_rel_target,
+                                target_mode: None,
+                            });
+                        } else {
+                            // Resource not found, keep original reference
+                            entries.push(RelEntry {
+                                id: rel.id.clone(),
+                                rel_type: rel.rel_type.clone(),
+                                target: rel.target.clone(),
+                                target_mode: rel.target_mode.clone(),
+                            });
+                        }
+                    }
+                }
+                build_rels_xml(&entries)?
+            } else {
+                // No .rels file - create minimal one with just layout reference
+                build_rels_xml(&[RelEntry {
+                    id: "rId1".to_string(),
+                    rel_type: "http://schemas.openxmlformats.org/officeDocument/2006/relationships/slideLayout".to_string(),
+                    target: base_layout_target.clone(),
+                    target_mode: None,
+                }])?
+            };
+
+            archive.insert(new_slide_rels_path, new_rels);
 
             // Add slide to presentation.xml
             let pres = archive.get("ppt/presentation.xml").unwrap().clone();
@@ -223,256 +173,26 @@ pub fn merge_pptx_files(input_files: &[impl AsRef<Path>], output: &Path) -> Resu
 
             // Add relationship in presentation.xml.rels
             let rels = archive.get("ppt/_rels/presentation.xml.rels").unwrap().clone();
-            let slide_target = format!("slides/slide{}.xml", counters.slide);
+            let slide_target = format!("slides/slide{}.xml", next_slide_num);
             let updated_rels = pptx::add_relationship_to_rels(&rels, &rid_str, SLIDE_REL_TYPE, &slide_target)?;
             archive.insert("ppt/_rels/presentation.xml.rels".to_string(), updated_rels);
 
-            copy_content_type(&src_ct, &src_slide_path, &new_slide_path, &mut archive)?;
+            // Add content type
+            let ct = archive.get("[Content_Types].xml").unwrap().clone();
+            let part_name = format!("/ppt/slides/slide{}.xml", next_slide_num);
+            let updated_ct = pptx::add_content_type_override(&ct, &part_name, SLIDE_CT)?;
+            archive.insert("[Content_Types].xml".to_string(), updated_ct);
 
             next_slide_id += 1;
             next_rid += 1;
-            counters.slide += 1;
+            next_slide_num += 1;
         }
     }
 
-    // Update docProps/app.xml with correct slide count
-    update_app_xml(&mut archive)?;
+    // Update docProps/app.xml
+    update_app_xml_slide_count(&mut archive);
 
     pptx::write_pptx(&archive, output)?;
-    Ok(())
-}
-
-struct Counters {
-    slide: u32,
-    layout: u32,
-    master: u32,
-    theme: u32,
-    media: u32,
-    notes: u32,
-    chart: u32,
-}
-
-/// Get sorted keys matching a directory prefix and suffix (excluding _rels).
-fn sorted_keys(archive: &pptx::PptxArchive, dir: &str, suffix: &str) -> Vec<String> {
-    let mut keys: Vec<String> = archive
-        .keys()
-        .filter(|k| k.starts_with(dir) && !k.contains("/_rels/") && k.ends_with(suffix))
-        .cloned()
-        .collect();
-    keys.sort();
-    keys
-}
-
-/// Pre-scan all .rels files in the source to find resources (media, charts, notesSlides, etc.)
-/// and assign them new names in path_remap.
-fn pre_scan_resources(
-    src: &pptx::PptxArchive,
-    path_remap: &mut HashMap<String, String>,
-    counters: &mut Counters,
-) -> Result<()> {
-    // Find all .rels files
-    let rels_files: Vec<String> = src
-        .keys()
-        .filter(|k| k.ends_with(".rels"))
-        .cloned()
-        .collect();
-
-    for rels_path in &rels_files {
-        let rels_data = src.get(rels_path).unwrap();
-        let rels = pptx::parse_rels(rels_data)?;
-
-        // Determine the context directory for this .rels file
-        // e.g. "ppt/slides/_rels/slide1.xml.rels" -> context is "ppt/slides"
-        let context_dir = rels_context_dir(rels_path);
-
-        for rel in &rels {
-            if rel.target.starts_with("http://") || rel.target.starts_with("https://")
-                || rel.target_mode.as_deref() == Some("External")
-            {
-                continue;
-            }
-
-            let abs_path = resolve_path(&context_dir, &rel.target);
-
-            // Skip if already remapped or doesn't exist in source
-            if path_remap.contains_key(&abs_path) || !src.contains_key(&abs_path) {
-                continue;
-            }
-
-            // Assign new name based on type
-            let new_path = if abs_path.starts_with("ppt/media/") {
-                let ext = abs_path.rsplit('.').next().unwrap_or("bin");
-                let p = format!("ppt/media/media{}.{}", counters.media, ext);
-                counters.media += 1;
-                p
-            } else if abs_path.starts_with("ppt/notesSlides/") && abs_path.ends_with(".xml") {
-                let p = format!("ppt/notesSlides/notesSlide{}.xml", counters.notes);
-                counters.notes += 1;
-                p
-            } else if abs_path.starts_with("ppt/charts/") && abs_path.ends_with(".xml") {
-                let p = format!("ppt/charts/chart{}.xml", counters.chart);
-                counters.chart += 1;
-                p
-            } else if abs_path.starts_with("ppt/embeddings/") {
-                let ext = abs_path.rsplit('.').next().unwrap_or("bin");
-                let p = format!("ppt/embeddings/embed{}.{}", counters.media, ext);
-                counters.media += 1;
-                p
-            } else if abs_path.starts_with("ppt/diagrams/") {
-                let filename = abs_path.rsplit('/').next().unwrap_or("data.xml");
-                let p = format!("ppt/diagrams/d{}_{}", counters.media, filename);
-                counters.media += 1;
-                p
-            } else if abs_path.starts_with("ppt/") {
-                // Generic fallback: preserve directory structure with unique prefix
-                let dir = abs_path.rsplit_once('/').map(|(d, _)| d).unwrap_or("ppt");
-                let filename = abs_path.rsplit('/').next().unwrap_or("file.bin");
-                let p = format!("{}/m{}_{}", dir, counters.media, filename);
-                counters.media += 1;
-                p
-            } else {
-                continue;
-            };
-
-            path_remap.insert(abs_path, new_path);
-        }
-    }
-
-    Ok(())
-}
-
-/// Copy a file and its .rels from src to dest, rewriting .rels targets using path_remap.
-fn copy_file_with_rels(
-    src: &pptx::PptxArchive,
-    dest: &mut pptx::PptxArchive,
-    src_ct: &ContentTypeMap,
-    path_remap: &HashMap<String, String>,
-    src_path: &str,
-    new_path: &str,
-    context_dir: &str,
-) -> Result<()> {
-    // Copy the main file
-    if let Some(data) = src.get(src_path) {
-        dest.insert(new_path.to_string(), data.clone());
-    }
-
-    // Copy and rewrite .rels file
-    let src_filename = src_path.rsplit('/').next().unwrap();
-    let src_dir = src_path.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
-    let src_rels_path = format!("{}/_rels/{}.rels", src_dir, src_filename);
-
-    let new_filename = new_path.rsplit('/').next().unwrap();
-    let new_dir = new_path.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
-    let new_rels_path = format!("{}/_rels/{}.rels", new_dir, new_filename);
-
-    if let Some(rels_data) = src.get(&src_rels_path) {
-        let rels = pptx::parse_rels(rels_data)?;
-        let mut entries: Vec<RelEntry> = Vec::new();
-
-        for rel in &rels {
-            let new_target = remap_target(context_dir, &rel.target, path_remap, new_dir);
-            entries.push(RelEntry {
-                id: rel.id.clone(),
-                rel_type: rel.rel_type.clone(),
-                target: new_target,
-                target_mode: rel.target_mode.clone(),
-            });
-        }
-
-        let new_rels_xml = build_rels_xml(&entries)?;
-        dest.insert(new_rels_path, new_rels_xml);
-
-        // Also copy referenced resources that have been remapped
-        for rel in &rels {
-            if rel.target.starts_with("http://") || rel.target.starts_with("https://") {
-                continue;
-            }
-            let abs_path = resolve_path(context_dir, &rel.target);
-            if let Some(new_abs) = path_remap.get(&abs_path) {
-                if !dest.contains_key(new_abs) {
-                    if let Some(data) = src.get(&abs_path) {
-                        dest.insert(new_abs.clone(), data.clone());
-
-                        // Add content type for known types
-                        copy_content_type(src_ct, &abs_path, new_abs, dest)?;
-
-                        // Recursively copy .rels for this resource (e.g. notesSlide has its own .rels)
-                        let res_src_dir = abs_path.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
-                        let res_new_dir = new_abs.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
-                        let res_filename = abs_path.rsplit('/').next().unwrap();
-                        let res_new_filename = new_abs.rsplit('/').next().unwrap();
-                        let res_rels_path = format!("{}/_rels/{}.rels", res_src_dir, res_filename);
-
-                        if let Some(res_rels_data) = src.get(&res_rels_path) {
-                            let res_rels = pptx::parse_rels(res_rels_data)?;
-                            let mut res_entries: Vec<RelEntry> = Vec::new();
-                            for r in &res_rels {
-                                let t = remap_target(res_src_dir, &r.target, path_remap, res_new_dir);
-                                res_entries.push(RelEntry {
-                                    id: r.id.clone(),
-                                    rel_type: r.rel_type.clone(),
-                                    target: t,
-                                    target_mode: r.target_mode.clone(),
-                                });
-
-                                // Copy sub-resources too
-                                if !r.target.starts_with("http") {
-                                    let sub_abs = resolve_path(res_src_dir, &r.target);
-                                    if let Some(new_sub) = path_remap.get(&sub_abs) {
-                                        if !dest.contains_key(new_sub) {
-                                            if let Some(d) = src.get(&sub_abs) {
-                                                dest.insert(new_sub.clone(), d.clone());
-                                                copy_content_type(src_ct, &sub_abs, new_sub, dest)?;
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                            let new_res_rels = build_rels_xml(&res_entries)?;
-                            let new_res_rels_path = format!("{}/_rels/{}.rels", res_new_dir, res_new_filename);
-                            dest.insert(new_res_rels_path, new_res_rels);
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    Ok(())
-}
-
-/// Remap a relationship target using path_remap.
-fn remap_target(
-    src_context: &str,
-    original_target: &str,
-    path_remap: &HashMap<String, String>,
-    new_context: &str,
-) -> String {
-    if original_target.starts_with("http://") || original_target.starts_with("https://") {
-        return original_target.to_string();
-    }
-
-    let abs_path = resolve_path(src_context, original_target);
-
-    if let Some(new_abs) = path_remap.get(&abs_path) {
-        make_relative(new_context, new_abs)
-    } else {
-        // Not remapped - keep original (it might be referencing something in the base file)
-        original_target.to_string()
-    }
-}
-
-/// Copy content type from source file's Content_Types to destination.
-/// Uses the source path to look up the correct content type, then registers it for the new path.
-fn copy_content_type(
-    src_ct: &ContentTypeMap,
-    src_path: &str,
-    new_path: &str,
-    archive: &mut pptx::PptxArchive,
-) -> Result<()> {
-    if let Some(ct) = src_ct.get_for_source(src_path) {
-        add_content_type(archive, &format!("/{}", new_path), &ct)?;
-    }
     Ok(())
 }
 
@@ -483,7 +203,6 @@ struct RelEntry {
     target_mode: Option<String>,
 }
 
-/// Build a .rels XML from a list of RelEntry.
 fn build_rels_xml(entries: &[RelEntry]) -> Result<Vec<u8>> {
     use quick_xml::events::{BytesDecl, BytesStart, Event};
     use quick_xml::writer::Writer;
@@ -510,159 +229,22 @@ fn build_rels_xml(entries: &[RelEntry]) -> Result<Vec<u8>> {
     Ok(writer.into_inner())
 }
 
-/// Copy all Default extension entries from source to destination.
-/// This ensures extensions like .emf, .wmf, .svg, .tiff are registered.
-fn merge_default_extensions(src_ct: &ContentTypeMap, dest: &mut pptx::PptxArchive) -> Result<()> {
-    for (ext, ct) in &src_ct.defaults {
-        let dest_ct_xml = dest.get("[Content_Types].xml")
-            .context("[Content_Types].xml が見つかりません")?
-            .clone();
-        let updated = pptx::add_content_type_default(&dest_ct_xml, ext, ct)?;
-        dest.insert("[Content_Types].xml".to_string(), updated);
-    }
-    Ok(())
-}
-
-fn add_content_type(archive: &mut pptx::PptxArchive, part_name: &str, content_type: &str) -> Result<()> {
-    let ct = archive.get("[Content_Types].xml")
-        .context("[Content_Types].xml が見つかりません")?
-        .clone();
-    let updated = pptx::add_content_type_override(&ct, part_name, content_type)?;
-    archive.insert("[Content_Types].xml".to_string(), updated);
-    Ok(())
-}
-
-/// Completely regenerate docProps/app.xml with correct metadata.
-fn update_app_xml(archive: &mut pptx::PptxArchive) -> Result<()> {
-    let total_slides = archive.keys()
-        .filter(|k| k.starts_with("ppt/slides/") && k.ends_with(".xml") && !k.contains("/_rels/"))
-        .count();
-
-    let total_notes = archive.keys()
-        .filter(|k| k.starts_with("ppt/notesSlides/") && k.ends_with(".xml") && !k.contains("/_rels/"))
-        .count();
-
-    // Count themes and collect their names
-    let theme_files: Vec<String> = archive.keys()
-        .filter(|k| k.starts_with("ppt/theme/") && k.ends_with(".xml") && !k.contains("/_rels/"))
-        .cloned()
-        .collect();
-    let theme_count = theme_files.len();
-
-    // Build theme names from theme XML files
-    let mut theme_names: Vec<String> = Vec::new();
-    for tf in &theme_files {
-        if let Some(data) = archive.get(tf) {
-            let name = extract_theme_name(data).unwrap_or_else(|| "Office Theme".to_string());
-            theme_names.push(name);
-        }
-    }
-    if theme_names.is_empty() {
-        theme_names.push("Office Theme".to_string());
-    }
-
-    // Rebuild app.xml with correct values
-    if let Some(app_xml) = archive.get("docProps/app.xml").cloned() {
-        let xml_str = String::from_utf8_lossy(&app_xml).to_string();
-
-        let updated = xml_str
-            // Update Slides count
-            .replace_tag_value("Slides", &total_slides.to_string())
-            // Update Notes count
-            .replace_tag_value("Notes", &total_notes.to_string());
-
-        // Update HeadingPairs and TitlesOfParts for themes
-        let updated = update_heading_pairs_and_titles(&updated, theme_count, &theme_names, total_slides);
-
-        archive.insert("docProps/app.xml".to_string(), updated.into_bytes());
-    }
-    Ok(())
-}
-
-fn extract_theme_name(theme_xml: &[u8]) -> Option<String> {
-    use quick_xml::events::Event;
-    use quick_xml::reader::Reader;
-
-    let mut reader = Reader::from_reader(theme_xml);
-    reader.config_mut().trim_text(true);
-    let mut buf = Vec::new();
-    loop {
-        match reader.read_event_into(&mut buf) {
-            Ok(Event::Start(ref e)) | Ok(Event::Empty(ref e)) => {
-                let name = e.name().as_ref().to_vec();
-                if local_name(&name) == b"theme" {
-                    for attr in e.attributes().flatten() {
-                        if attr.key.as_ref() == b"name" {
-                            return std::str::from_utf8(&attr.value).ok().map(|s| s.to_string());
-                        }
+/// Find the base file's first slide's layout target.
+fn find_base_layout_target(archive: &pptx::PptxArchive) -> String {
+    // Check slide1, slide2, etc.
+    for i in 1..=20 {
+        let rels_path = format!("ppt/slides/_rels/slide{}.xml.rels", i);
+        if let Some(rels_data) = archive.get(&rels_path) {
+            if let Ok(rels) = pptx::parse_rels(rels_data) {
+                for rel in &rels {
+                    if rel.rel_type.ends_with("/slideLayout") {
+                        return rel.target.clone();
                     }
                 }
             }
-            Ok(Event::Eof) => break,
-            _ => {}
         }
-        buf.clear();
     }
-    None
-}
-
-trait ReplaceTagValue {
-    fn replace_tag_value(&self, tag: &str, value: &str) -> String;
-}
-
-impl ReplaceTagValue for String {
-    fn replace_tag_value(&self, tag: &str, value: &str) -> String {
-        let open = format!("<{}>", tag);
-        let close = format!("</{}>", tag);
-        if let Some(start) = self.find(&open) {
-            let after_open = start + open.len();
-            if let Some(end) = self[after_open..].find(&close) {
-                let mut result = String::new();
-                result.push_str(&self[..after_open]);
-                result.push_str(value);
-                result.push_str(&self[after_open + end..]);
-                return result;
-            }
-        }
-        self.clone()
-    }
-}
-
-fn update_heading_pairs_and_titles(xml: &str, theme_count: usize, theme_names: &[String], _slide_count: usize) -> String {
-    // Build new HeadingPairs section
-    let ns = "http://schemas.openxmlformats.org/officeDocument/2006/docPropsVTypes";
-    let titles_size = theme_count;
-
-    let heading_pairs = format!(
-        r#"<HeadingPairs><vt:vector size="4" baseType="variant"><vt:variant><vt:lpstr>Theme</vt:lpstr></vt:variant><vt:variant><vt:i4>{}</vt:i4></vt:variant><vt:variant><vt:lpstr>Slide Titles</vt:lpstr></vt:variant><vt:variant><vt:i4>0</vt:i4></vt:variant></vt:vector></HeadingPairs>"#,
-        theme_count
-    );
-
-    let theme_list: String = theme_names.iter()
-        .map(|n| format!("<vt:lpstr>{}</vt:lpstr>", n))
-        .collect::<Vec<_>>()
-        .join("");
-    let titles_of_parts = format!(
-        r#"<TitlesOfParts><vt:vector size="{}" baseType="lpstr">{}</vt:vector></TitlesOfParts>"#,
-        titles_size, theme_list
-    );
-
-    let mut result = xml.to_string();
-
-    // Replace HeadingPairs
-    if let (Some(start), Some(end)) = (result.find("<HeadingPairs>"), result.find("</HeadingPairs>")) {
-        let end = end + "</HeadingPairs>".len();
-        result = format!("{}{}{}", &result[..start], heading_pairs, &result[end..]);
-    }
-
-    // Replace TitlesOfParts
-    if let (Some(start), Some(end)) = (result.find("<TitlesOfParts>"), result.find("</TitlesOfParts>")) {
-        let end = end + "</TitlesOfParts>".len();
-        result = format!("{}{}{}", &result[..start], titles_of_parts, &result[end..]);
-    }
-
-    let _ = ns; // suppress warning
-    result
+    "../slideLayouts/slideLayout1.xml".to_string()
 }
 
 fn normalize_ppt_path(rel_target: &str, base: &str) -> String {
@@ -686,34 +268,6 @@ fn resolve_path(base_dir: &str, relative: &str) -> String {
         }
     }
     parts.join("/")
-}
-
-fn make_relative(context_dir: &str, target_abs: &str) -> String {
-    let ctx_parts: Vec<&str> = context_dir.split('/').collect();
-    let tgt_parts: Vec<&str> = target_abs.split('/').collect();
-
-    let common = ctx_parts.iter().zip(tgt_parts.iter())
-        .take_while(|(a, b)| a == b)
-        .count();
-
-    let ups = ctx_parts.len() - common;
-    let mut result = String::new();
-    for _ in 0..ups {
-        result.push_str("../");
-    }
-    result.push_str(&tgt_parts[common..].join("/"));
-    result
-}
-
-/// Extract the context directory from a .rels file path.
-/// e.g. "ppt/slides/_rels/slide1.xml.rels" -> "ppt/slides"
-fn rels_context_dir(rels_path: &str) -> String {
-    // Remove _rels/filename.rels to get the parent dir
-    if let Some(pos) = rels_path.rfind("/_rels/") {
-        rels_path[..pos].to_string()
-    } else {
-        String::new()
-    }
 }
 
 fn find_max_number(archive: &pptx::PptxArchive, dir: &str, prefix: &str, suffix: &str) -> u32 {
@@ -747,87 +301,22 @@ fn find_max_media_number(archive: &pptx::PptxArchive) -> u32 {
         .unwrap_or(0)
 }
 
-/// Parse the highest sldMasterId from presentation.xml.
-/// Find the max sldLayoutId across all slideMasters in the archive.
-fn find_max_layout_id_in_archive(archive: &pptx::PptxArchive) -> u32 {
-    use quick_xml::events::Event;
-    use quick_xml::reader::Reader;
+/// Update slide count in docProps/app.xml.
+fn update_app_xml_slide_count(archive: &mut pptx::PptxArchive) {
+    let total_slides = archive.keys()
+        .filter(|k| k.starts_with("ppt/slides/") && k.ends_with(".xml") && !k.contains("/_rels/"))
+        .count();
 
-    let mut max_id: u32 = 2147483648;
-
-    for (name, data) in archive {
-        if !name.starts_with("ppt/slideMasters/") || name.contains("/_rels/") || !name.ends_with(".xml") {
-            continue;
-        }
-        let mut reader = Reader::from_reader(data.as_slice());
-        reader.config_mut().trim_text(true);
-        let mut buf = Vec::new();
-        loop {
-            match reader.read_event_into(&mut buf) {
-                Ok(Event::Start(ref e)) | Ok(Event::Empty(ref e)) => {
-                    let n = e.name().as_ref().to_vec();
-                    if local_name(&n) == b"sldLayoutId" {
-                        for attr in e.attributes().flatten() {
-                            if attr.key.as_ref() == b"id" {
-                                if let Ok(val) = std::str::from_utf8(&attr.value) {
-                                    if let Ok(id) = val.parse::<u32>() {
-                                        if id >= max_id {
-                                            max_id = id;
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                Ok(Event::Eof) => break,
-                _ => {}
+    if let Some(app_xml) = archive.get("docProps/app.xml").cloned() {
+        let xml_str = String::from_utf8_lossy(&app_xml).to_string();
+        if let Some(start) = xml_str.find("<Slides>") {
+            if let Some(end) = xml_str[start..].find("</Slides>") {
+                let mut result = String::new();
+                result.push_str(&xml_str[..start]);
+                result.push_str(&format!("<Slides>{}</Slides>", total_slides));
+                result.push_str(&xml_str[start + end + "</Slides>".len()..]);
+                archive.insert("docProps/app.xml".to_string(), result.into_bytes());
             }
-            buf.clear();
         }
-    }
-    max_id
-}
-
-fn parse_max_master_id(xml: &[u8]) -> u32 {
-    // Master IDs typically start at 2147483648
-    use quick_xml::events::Event;
-    use quick_xml::reader::Reader;
-
-    let mut reader = Reader::from_reader(xml);
-    reader.config_mut().trim_text(true);
-    let mut buf = Vec::new();
-    let mut max_id: u32 = 2147483648;
-
-    loop {
-        match reader.read_event_into(&mut buf) {
-            Ok(Event::Start(ref e)) | Ok(Event::Empty(ref e)) => {
-                let name = e.name().as_ref().to_vec();
-                if local_name(&name) == b"sldMasterId" {
-                    for attr in e.attributes().flatten() {
-                        if attr.key.as_ref() == b"id" {
-                            if let Ok(val) = std::str::from_utf8(&attr.value) {
-                                if let Ok(id) = val.parse::<u32>() {
-                                    if id >= max_id {
-                                        max_id = id;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            Ok(Event::Eof) => break,
-            _ => {}
-        }
-        buf.clear();
-    }
-    max_id
-}
-
-fn local_name(name: &[u8]) -> &[u8] {
-    match name.iter().position(|&b| b == b':') {
-        Some(pos) => &name[pos + 1..],
-        None => name,
     }
 }
