@@ -68,7 +68,6 @@ pub fn merge_pptx_files(input_files: &[impl AsRef<Path>], output: &Path) -> Resu
         .clone();
     let base_slides = pptx::parse_slide_list(&pres_xml)?;
     let mut next_slide_id = pptx::max_slide_id(&base_slides) + 1;
-    let mut next_master_id = parse_max_master_id(&pres_xml) + 1;
 
     let pres_rels_xml = archive
         .get("ppt/_rels/presentation.xml.rels")
@@ -77,8 +76,12 @@ pub fn merge_pptx_files(input_files: &[impl AsRef<Path>], output: &Path) -> Resu
     let base_rels = pptx::parse_rels(&pres_rels_xml)?;
     let mut next_rid = pptx::max_rid(&base_rels) + 1;
 
-    // Track the next available layout ID (these must be globally unique across all masters)
-    let mut next_layout_id = find_max_layout_id_in_archive(&archive) + 1;
+    // Master IDs and Layout IDs share the same ID space - must all be unique
+    // Find the max across both, then use that as the starting point for layout IDs
+    let max_master_id = parse_max_master_id(&pres_xml);
+    let max_layout_id = find_max_layout_id_in_archive(&archive);
+    let mut next_layout_id = std::cmp::max(max_master_id, max_layout_id) + 1;
+    // next_master_id will be set after layout IDs are assigned (see below)
 
     let mut counters = Counters {
         slide: find_max_number(&archive, "ppt/slides/", "slide", ".xml") + 1,
@@ -168,9 +171,13 @@ pub fn merge_pptx_files(input_files: &[impl AsRef<Path>], output: &Path) -> Resu
             copy_content_type(&src_ct, src_path, &new_path, &mut archive)?;
 
             // Register master in presentation.xml
+            // Use next_layout_id for master ID too (they share the same ID space)
+            let this_master_id = next_layout_id;
+            next_layout_id += 1;
+
             let pres = archive.get("ppt/presentation.xml").unwrap().clone();
             let rid_str = format!("rId{}", next_rid);
-            let updated_pres = pptx::add_master_to_presentation_xml(&pres, next_master_id, &rid_str)?;
+            let updated_pres = pptx::add_master_to_presentation_xml(&pres, this_master_id, &rid_str)?;
             archive.insert("ppt/presentation.xml".to_string(), updated_pres);
 
             // Add relationship in presentation.xml.rels
@@ -180,7 +187,6 @@ pub fn merge_pptx_files(input_files: &[impl AsRef<Path>], output: &Path) -> Resu
             archive.insert("ppt/_rels/presentation.xml.rels".to_string(), updated_rels);
 
             next_rid += 1;
-            next_master_id += 1;
         }
 
         // Copy slideLayouts
@@ -228,6 +234,9 @@ pub fn merge_pptx_files(input_files: &[impl AsRef<Path>], output: &Path) -> Resu
             counters.slide += 1;
         }
     }
+
+    // Update docProps/app.xml with correct slide count
+    update_app_xml_slide_count(&mut archive)?;
 
     pptx::write_pptx(&archive, output)?;
     Ok(())
@@ -520,6 +529,33 @@ fn add_content_type(archive: &mut pptx::PptxArchive, part_name: &str, content_ty
         .clone();
     let updated = pptx::add_content_type_override(&ct, part_name, content_type)?;
     archive.insert("[Content_Types].xml".to_string(), updated);
+    Ok(())
+}
+
+/// Update the slide count in docProps/app.xml to match actual number of slides.
+fn update_app_xml_slide_count(archive: &mut pptx::PptxArchive) -> Result<()> {
+    let total_slides = archive.keys()
+        .filter(|k| k.starts_with("ppt/slides/") && k.ends_with(".xml") && !k.contains("/_rels/"))
+        .count();
+
+    if let Some(app_xml) = archive.get("docProps/app.xml").cloned() {
+        let xml_str = String::from_utf8_lossy(&app_xml);
+        // Simple regex-like replacement for <Slides>N</Slides>
+        let updated = if let Some(start) = xml_str.find("<Slides>") {
+            if let Some(end) = xml_str[start..].find("</Slides>") {
+                let mut result = String::new();
+                result.push_str(&xml_str[..start]);
+                result.push_str(&format!("<Slides>{}</Slides>", total_slides));
+                result.push_str(&xml_str[start + end + "</Slides>".len()..]);
+                result
+            } else {
+                return Ok(());
+            }
+        } else {
+            return Ok(());
+        };
+        archive.insert("docProps/app.xml".to_string(), updated.into_bytes());
+    }
     Ok(())
 }
 
