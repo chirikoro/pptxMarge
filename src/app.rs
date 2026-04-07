@@ -234,11 +234,23 @@ impl PptxMargeApp {
             return CleanupResult::Failed("ファイルリネーム失敗".to_string());
         }
 
-        let src = temp.to_string_lossy().replace('\\', "/");
-        let dst = path.to_string_lossy().replace('\\', "/");
+        let src = temp.to_string_lossy().to_string();
+        let dst = path.to_string_lossy().to_string();
 
         let script = format!(
-            "import sys\ntry:\n from pptx import Presentation\nexcept ImportError:\n print('NO_PPTX',file=sys.stderr);sys.exit(2)\ntry:\n p=Presentation(r'{}')\n p.save(r'{}')\nexcept Exception as e:\n print(f'ERR:{{e}}',file=sys.stderr);sys.exit(1)",
+            r#"import sys
+try:
+    from pptx import Presentation
+except ImportError:
+    print("NO_PPTX",file=sys.stderr)
+    sys.exit(2)
+try:
+    p=Presentation(r"{}")
+    p.save(r"{}")
+except Exception as e:
+    print("ERR:"+str(e),file=sys.stderr)
+    sys.exit(1)
+"#,
             src, dst
         );
 
@@ -251,27 +263,40 @@ impl PptxMargeApp {
 
         let mut last_err = String::new();
         for cmd in &python_cmds {
-            let result = std::process::Command::new(cmd)
-                .arg("-c")
-                .arg(&script)
-                .output();
+            use std::process::Stdio;
+            use std::io::Write;
 
-            match result {
-                Ok(output) if output.status.success() && path.exists() => {
-                    let _ = std::fs::remove_file(&temp);
-                    return CleanupResult::Success;
-                }
-                Ok(output) => {
-                    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-                    if stderr.contains("NO_PPTX") {
-                        let _ = std::fs::rename(&temp, path);
-                        return CleanupResult::NoPython("pip install python-pptx を実行してください".to_string());
+            let child = std::process::Command::new(cmd)
+                .arg("-")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn();
+
+            match child {
+                Ok(mut child) => {
+                    if let Some(mut stdin) = child.stdin.take() {
+                        let _ = stdin.write_all(script.as_bytes());
                     }
-                    last_err = format!("{}: {}", cmd, stderr);
+                    match child.wait_with_output() {
+                        Ok(output) if output.status.success() && path.exists() => {
+                            let _ = std::fs::remove_file(&temp);
+                            return CleanupResult::Success;
+                        }
+                        Ok(output) => {
+                            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+                            if stderr.contains("NO_PPTX") {
+                                let _ = std::fs::rename(&temp, path);
+                                return CleanupResult::NoPython("pip install python-pptx を実行してください".to_string());
+                            }
+                            last_err = format!("{}: {}", cmd, stderr);
+                        }
+                        Err(e) => {
+                            last_err = format!("{} 実行エラー: {}", cmd, e);
+                        }
+                    }
                 }
-                Err(_) => {
-                    continue;
-                }
+                Err(_) => continue,
             }
         }
 
