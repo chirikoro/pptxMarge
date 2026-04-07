@@ -267,65 +267,6 @@ pub fn add_content_type_override(
     Ok(writer.into_inner())
 }
 
-/// Rewrite slide relationship file: update media references with new names
-/// and point the slideLayout reference to a given layout.
-pub fn rewrite_slide_rels(
-    rels_xml: &[u8],
-    media_renames: &HashMap<String, String>,
-    base_layout_target: &str,
-) -> Result<Vec<u8>> {
-    let mut reader = Reader::from_reader(rels_xml);
-    reader.config_mut().trim_text(false);
-    let mut writer = Writer::new(Vec::new());
-    let mut buf = Vec::new();
-
-    loop {
-        match reader.read_event_into(&mut buf) {
-            Ok(Event::Start(ref e)) | Ok(Event::Empty(ref e))
-                if local_name(e.name().as_ref()) == b"Relationship" =>
-            {
-                let mut id = String::new();
-                let mut rel_type = String::new();
-                let mut target = String::new();
-                for attr in e.attributes().flatten() {
-                    match attr.key.as_ref() {
-                        b"Id" => id = std::str::from_utf8(&attr.value)?.to_string(),
-                        b"Type" => rel_type = std::str::from_utf8(&attr.value)?.to_string(),
-                        b"Target" => target = std::str::from_utf8(&attr.value)?.to_string(),
-                        _ => {}
-                    }
-                }
-
-                // Rewrite slideLayout reference
-                if rel_type.ends_with("/slideLayout") {
-                    target = base_layout_target.to_string();
-                }
-
-                // Rewrite media references
-                if let Some(new_target) = media_renames.get(&target) {
-                    target = new_target.clone();
-                }
-
-                let mut elem = BytesStart::new("Relationship");
-                elem.push_attribute(("Id", id.as_str()));
-                elem.push_attribute(("Type", rel_type.as_str()));
-                elem.push_attribute(("Target", target.as_str()));
-                writer.write_event(Event::Empty(elem))?;
-            }
-            Ok(Event::Eof) => {
-                writer.write_event(Event::Eof)?;
-                break;
-            }
-            Ok(e) => {
-                writer.write_event(e)?;
-            }
-            Err(e) => return Err(anyhow::anyhow!("slide rels XML処理エラー: {}", e)),
-        }
-        buf.clear();
-    }
-    Ok(writer.into_inner())
-}
-
 /// Get the highest rId number from a rels file.
 pub fn max_rid(rels: &[Relationship]) -> u32 {
     rels.iter()
