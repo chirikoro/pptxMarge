@@ -5,23 +5,52 @@ use anyhow::{Context, Result};
 
 use crate::pptx;
 
-const SLIDE_CT: &str =
-    "application/vnd.openxmlformats-officedocument.presentationml.slide+xml";
-const LAYOUT_CT: &str =
-    "application/vnd.openxmlformats-officedocument.presentationml.slideLayout+xml";
-const MASTER_CT: &str =
-    "application/vnd.openxmlformats-officedocument.presentationml.slideMaster+xml";
-const THEME_CT: &str =
-    "application/vnd.openxmlformats-officedocument.drawingml.theme+xml";
-const NOTES_SLIDE_CT: &str =
-    "application/vnd.openxmlformats-officedocument.presentationml.notesSlide+xml";
-const CHART_CT: &str =
-    "application/vnd.openxmlformats-officedocument.drawingml.chart+xml";
-
 const SLIDE_REL_TYPE: &str =
     "http://schemas.openxmlformats.org/officeDocument/2006/relationships/slide";
 const MASTER_REL_TYPE: &str =
     "http://schemas.openxmlformats.org/officeDocument/2006/relationships/slideMaster";
+
+/// Content-type map built from source file's [Content_Types].xml.
+/// Maps archive path (without leading /) -> content type string.
+struct ContentTypeMap {
+    overrides: HashMap<String, String>,
+    defaults: HashMap<String, String>,
+}
+
+impl ContentTypeMap {
+    fn from_archive(archive: &pptx::PptxArchive) -> Result<Self> {
+        if let Some(ct_xml) = archive.get("[Content_Types].xml") {
+            let (overrides, defaults) = pptx::parse_content_types(ct_xml)?;
+            Ok(Self { overrides, defaults })
+        } else {
+            Ok(Self {
+                overrides: HashMap::new(),
+                defaults: HashMap::new(),
+            })
+        }
+    }
+
+    /// Look up the content type for a given archive path (e.g. "ppt/slides/slide1.xml").
+    fn get(&self, archive_path: &str) -> Option<String> {
+        // Try Override first (with leading /)
+        let part_name = format!("/{}", archive_path);
+        if let Some(ct) = self.overrides.get(&part_name) {
+            return Some(ct.clone());
+        }
+        // Fall back to Default by extension
+        if let Some(ext) = archive_path.rsplit('.').next() {
+            if let Some(ct) = self.defaults.get(ext) {
+                return Some(ct.clone());
+            }
+        }
+        None
+    }
+
+    /// Look up content type for a source path, using the original path before renaming.
+    fn get_for_source(&self, src_path: &str) -> Option<String> {
+        self.get(src_path)
+    }
+}
 
 /// Merge multiple PPTX files into one output file.
 pub fn merge_pptx_files(input_files: &[impl AsRef<Path>], output: &Path) -> Result<()> {
@@ -77,6 +106,9 @@ pub fn merge_pptx_files(input_files: &[impl AsRef<Path>], output: &Path) -> Resu
             .map(|r| (r.id.clone(), r.target.clone()))
             .collect();
 
+        // Build content type map from source file
+        let src_ct = ContentTypeMap::from_archive(&src)?;
+
         // === Phase 1: Build COMPLETE path_remap before copying anything ===
         let mut path_remap: HashMap<String, String> = HashMap::new();
 
@@ -112,15 +144,15 @@ pub fn merge_pptx_files(input_files: &[impl AsRef<Path>], output: &Path) -> Resu
         // Copy themes
         for src_path in &src_themes {
             let new_path = path_remap.get(src_path).unwrap().clone();
-            copy_file_with_rels(&src, &mut archive, &path_remap, src_path, &new_path, "ppt/theme")?;
-            add_content_type(&mut archive, &format!("/{}", new_path), THEME_CT)?;
+            copy_file_with_rels(&src, &mut archive, &src_ct, &path_remap, src_path, &new_path, "ppt/theme")?;
+            copy_content_type(&src_ct, src_path, &new_path, &mut archive)?;
         }
 
         // Copy slideMasters
         for src_path in &src_masters {
             let new_path = path_remap.get(src_path).unwrap().clone();
-            copy_file_with_rels(&src, &mut archive, &path_remap, src_path, &new_path, "ppt/slideMasters")?;
-            add_content_type(&mut archive, &format!("/{}", new_path), MASTER_CT)?;
+            copy_file_with_rels(&src, &mut archive, &src_ct, &path_remap, src_path, &new_path, "ppt/slideMasters")?;
+            copy_content_type(&src_ct, src_path, &new_path, &mut archive)?;
 
             // Register master in presentation.xml
             let pres = archive.get("ppt/presentation.xml").unwrap().clone();
@@ -141,8 +173,8 @@ pub fn merge_pptx_files(input_files: &[impl AsRef<Path>], output: &Path) -> Resu
         // Copy slideLayouts
         for src_path in &src_layouts {
             let new_path = path_remap.get(src_path).unwrap().clone();
-            copy_file_with_rels(&src, &mut archive, &path_remap, src_path, &new_path, "ppt/slideLayouts")?;
-            add_content_type(&mut archive, &format!("/{}", new_path), LAYOUT_CT)?;
+            copy_file_with_rels(&src, &mut archive, &src_ct, &path_remap, src_path, &new_path, "ppt/slideLayouts")?;
+            copy_content_type(&src_ct, src_path, &new_path, &mut archive)?;
         }
 
         // === Phase 3: Copy slides ===
@@ -162,7 +194,7 @@ pub fn merge_pptx_files(input_files: &[impl AsRef<Path>], output: &Path) -> Resu
             // Add to remap (in case other things reference this slide)
             path_remap.insert(src_slide_path.clone(), new_slide_path.clone());
 
-            copy_file_with_rels(&src, &mut archive, &path_remap, &src_slide_path, &new_slide_path, "ppt/slides")?;
+            copy_file_with_rels(&src, &mut archive, &src_ct, &path_remap, &src_slide_path, &new_slide_path, "ppt/slides")?;
 
             // Add slide to presentation.xml
             let pres = archive.get("ppt/presentation.xml").unwrap().clone();
@@ -176,7 +208,7 @@ pub fn merge_pptx_files(input_files: &[impl AsRef<Path>], output: &Path) -> Resu
             let updated_rels = pptx::add_relationship_to_rels(&rels, &rid_str, SLIDE_REL_TYPE, &slide_target)?;
             archive.insert("ppt/_rels/presentation.xml.rels".to_string(), updated_rels);
 
-            add_content_type(&mut archive, &format!("/ppt/slides/slide{}.xml", counters.slide), SLIDE_CT)?;
+            copy_content_type(&src_ct, &src_slide_path, &new_slide_path, &mut archive)?;
 
             next_slide_id += 1;
             next_rid += 1;
@@ -285,6 +317,7 @@ fn pre_scan_resources(
 fn copy_file_with_rels(
     src: &pptx::PptxArchive,
     dest: &mut pptx::PptxArchive,
+    src_ct: &ContentTypeMap,
     path_remap: &HashMap<String, String>,
     src_path: &str,
     new_path: &str,
@@ -333,7 +366,7 @@ fn copy_file_with_rels(
                         dest.insert(new_abs.clone(), data.clone());
 
                         // Add content type for known types
-                        add_content_type_for_path(dest, new_abs)?;
+                        copy_content_type(src_ct, &abs_path, new_abs, dest)?;
 
                         // Recursively copy .rels for this resource (e.g. notesSlide has its own .rels)
                         let res_src_dir = abs_path.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
@@ -361,7 +394,7 @@ fn copy_file_with_rels(
                                         if !dest.contains_key(new_sub) {
                                             if let Some(d) = src.get(&sub_abs) {
                                                 dest.insert(new_sub.clone(), d.clone());
-                                                add_content_type_for_path(dest, new_sub)?;
+                                                copy_content_type(src_ct, &sub_abs, new_sub, dest)?;
                                             }
                                         }
                                     }
@@ -401,18 +434,16 @@ fn remap_target(
     }
 }
 
-/// Add content type override for a file path based on its extension/location.
-fn add_content_type_for_path(archive: &mut pptx::PptxArchive, path: &str) -> Result<()> {
-    let ct = if path.starts_with("ppt/notesSlides/") && path.ends_with(".xml") {
-        Some(NOTES_SLIDE_CT)
-    } else if path.starts_with("ppt/charts/") && path.ends_with(".xml") {
-        Some(CHART_CT)
-    } else {
-        None // Media files are handled by Default extensions in Content_Types
-    };
-
-    if let Some(content_type) = ct {
-        add_content_type(archive, &format!("/{}", path), content_type)?;
+/// Copy content type from source file's Content_Types to destination.
+/// Uses the source path to look up the correct content type, then registers it for the new path.
+fn copy_content_type(
+    src_ct: &ContentTypeMap,
+    src_path: &str,
+    new_path: &str,
+    archive: &mut pptx::PptxArchive,
+) -> Result<()> {
+    if let Some(ct) = src_ct.get_for_source(src_path) {
+        add_content_type(archive, &format!("/{}", new_path), &ct)?;
     }
     Ok(())
 }

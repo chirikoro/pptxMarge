@@ -318,6 +318,57 @@ pub fn max_slide_id(slides: &[SlideInfo]) -> u32 {
     slides.iter().map(|s| s.id).max().unwrap_or(255)
 }
 
+/// Parse [Content_Types].xml and return a map of PartName -> ContentType (Override entries)
+/// and a map of Extension -> ContentType (Default entries).
+pub fn parse_content_types(xml: &[u8]) -> Result<(HashMap<String, String>, HashMap<String, String>)> {
+    let mut reader = Reader::from_reader(xml);
+    reader.config_mut().trim_text(true);
+    let mut buf = Vec::new();
+    let mut overrides: HashMap<String, String> = HashMap::new();
+    let mut defaults: HashMap<String, String> = HashMap::new();
+
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Start(ref e)) | Ok(Event::Empty(ref e)) => {
+                let name_bytes = e.name().as_ref().to_vec();
+                let tag = local_name(&name_bytes);
+                if tag == b"Override" {
+                    let mut part = String::new();
+                    let mut ct = String::new();
+                    for attr in e.attributes().flatten() {
+                        match attr.key.as_ref() {
+                            b"PartName" => part = std::str::from_utf8(&attr.value)?.to_string(),
+                            b"ContentType" => ct = std::str::from_utf8(&attr.value)?.to_string(),
+                            _ => {}
+                        }
+                    }
+                    if !part.is_empty() && !ct.is_empty() {
+                        overrides.insert(part, ct);
+                    }
+                } else if tag == b"Default" {
+                    let mut ext = String::new();
+                    let mut ct = String::new();
+                    for attr in e.attributes().flatten() {
+                        match attr.key.as_ref() {
+                            b"Extension" => ext = std::str::from_utf8(&attr.value)?.to_string(),
+                            b"ContentType" => ct = std::str::from_utf8(&attr.value)?.to_string(),
+                            _ => {}
+                        }
+                    }
+                    if !ext.is_empty() && !ct.is_empty() {
+                        defaults.insert(ext, ct);
+                    }
+                }
+            }
+            Ok(Event::Eof) => break,
+            Err(e) => return Err(anyhow::anyhow!("Content_Types XML解析エラー: {}", e)),
+            _ => {}
+        }
+        buf.clear();
+    }
+    Ok((overrides, defaults))
+}
+
 /// Extract local name from a possibly namespaced XML name (e.g. "p:sldId" -> "sldId").
 fn local_name(name: &[u8]) -> &[u8] {
     match name.iter().position(|&b| b == b':') {
