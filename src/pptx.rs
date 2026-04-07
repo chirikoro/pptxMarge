@@ -161,6 +161,40 @@ pub fn parse_rels(rels_xml: &[u8]) -> Result<Vec<Relationship>> {
     Ok(rels)
 }
 
+/// Add a slideMaster ID entry to presentation.xml's <p:sldMasterIdLst>. Returns the modified XML.
+pub fn add_master_to_presentation_xml(
+    xml: &[u8],
+    master_id: u32,
+    r_id: &str,
+) -> Result<Vec<u8>> {
+    let mut reader = Reader::from_reader(xml);
+    reader.config_mut().trim_text(false);
+    let mut writer = Writer::new(Vec::new());
+    let mut buf = Vec::new();
+
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::End(ref e)) if local_name(e.name().as_ref()) == b"sldMasterIdLst" => {
+                let mut elem = BytesStart::new("p:sldMasterId");
+                elem.push_attribute(("id", master_id.to_string().as_str()));
+                elem.push_attribute(("r:id", r_id));
+                writer.write_event(Event::Empty(elem))?;
+                writer.write_event(Event::End(e.clone()))?;
+            }
+            Ok(Event::Eof) => {
+                writer.write_event(Event::Eof)?;
+                break;
+            }
+            Ok(e) => {
+                writer.write_event(e)?;
+            }
+            Err(e) => return Err(anyhow::anyhow!("XML処理エラー: {}", e)),
+        }
+        buf.clear();
+    }
+    Ok(writer.into_inner())
+}
+
 /// Add a slide ID entry to presentation.xml. Returns the modified XML.
 pub fn add_slide_to_presentation_xml(
     xml: &[u8],
