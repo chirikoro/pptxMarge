@@ -77,6 +77,9 @@ pub fn merge_pptx_files(input_files: &[impl AsRef<Path>], output: &Path) -> Resu
     let base_rels = pptx::parse_rels(&pres_rels_xml)?;
     let mut next_rid = pptx::max_rid(&base_rels) + 1;
 
+    // Track the next available layout ID (these must be globally unique across all masters)
+    let mut next_layout_id = find_max_layout_id_in_archive(&archive) + 1;
+
     let mut counters = Counters {
         slide: find_max_number(&archive, "ppt/slides/", "slide", ".xml") + 1,
         layout: find_max_number(&archive, "ppt/slideLayouts/", "slideLayout", ".xml") + 1,
@@ -152,10 +155,16 @@ pub fn merge_pptx_files(input_files: &[impl AsRef<Path>], output: &Path) -> Resu
             copy_content_type(&src_ct, src_path, &new_path, &mut archive)?;
         }
 
-        // Copy slideMasters
+        // Copy slideMasters (rewrite layout IDs to avoid duplicates)
         for src_path in &src_masters {
             let new_path = path_remap.get(src_path).unwrap().clone();
             copy_file_with_rels(&src, &mut archive, &src_ct, &path_remap, src_path, &new_path, "ppt/slideMasters")?;
+
+            // Rewrite sldLayoutId IDs in the copied master to be globally unique
+            let master_xml = archive.get(&new_path).unwrap().clone();
+            let rewritten = pptx::rewrite_layout_ids_in_master(&master_xml, &mut next_layout_id)?;
+            archive.insert(new_path.clone(), rewritten);
+
             copy_content_type(&src_ct, src_path, &new_path, &mut archive)?;
 
             // Register master in presentation.xml
@@ -597,6 +606,47 @@ fn find_max_media_number(archive: &pptx::PptxArchive) -> u32 {
 }
 
 /// Parse the highest sldMasterId from presentation.xml.
+/// Find the max sldLayoutId across all slideMasters in the archive.
+fn find_max_layout_id_in_archive(archive: &pptx::PptxArchive) -> u32 {
+    use quick_xml::events::Event;
+    use quick_xml::reader::Reader;
+
+    let mut max_id: u32 = 2147483648;
+
+    for (name, data) in archive {
+        if !name.starts_with("ppt/slideMasters/") || name.contains("/_rels/") || !name.ends_with(".xml") {
+            continue;
+        }
+        let mut reader = Reader::from_reader(data.as_slice());
+        reader.config_mut().trim_text(true);
+        let mut buf = Vec::new();
+        loop {
+            match reader.read_event_into(&mut buf) {
+                Ok(Event::Start(ref e)) | Ok(Event::Empty(ref e)) => {
+                    let n = e.name().as_ref().to_vec();
+                    if local_name(&n) == b"sldLayoutId" {
+                        for attr in e.attributes().flatten() {
+                            if attr.key.as_ref() == b"id" {
+                                if let Ok(val) = std::str::from_utf8(&attr.value) {
+                                    if let Ok(id) = val.parse::<u32>() {
+                                        if id >= max_id {
+                                            max_id = id;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                Ok(Event::Eof) => break,
+                _ => {}
+            }
+            buf.clear();
+        }
+    }
+    max_id
+}
+
 fn parse_max_master_id(xml: &[u8]) -> u32 {
     // Master IDs typically start at 2147483648
     use quick_xml::events::Event;

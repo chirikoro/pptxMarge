@@ -312,6 +312,74 @@ pub fn add_content_type_default(
     Ok(writer.into_inner())
 }
 
+/// Rewrite sldLayoutId "id" attributes in a slideMaster XML to use new unique IDs.
+/// `next_id` is a mutable counter; each layout gets the next ID and the counter increments.
+/// Returns the modified XML.
+pub fn rewrite_layout_ids_in_master(xml: &[u8], next_id: &mut u32) -> Result<Vec<u8>> {
+    let mut reader = Reader::from_reader(xml);
+    reader.config_mut().trim_text(false);
+    let mut writer = Writer::new(Vec::new());
+    let mut buf = Vec::new();
+
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Empty(ref e)) => {
+                let name_bytes = e.name().as_ref().to_vec();
+                if local_name(&name_bytes) == b"sldLayoutId" {
+                    // Rewrite with new id, preserving r:id
+                    let mut new_elem = BytesStart::new(
+                        std::str::from_utf8(e.name().as_ref())?.to_string()
+                    );
+                    for attr in e.attributes().flatten() {
+                        if attr.key.as_ref() == b"id" {
+                            new_elem.push_attribute(("id", next_id.to_string().as_str()));
+                            *next_id += 1;
+                        } else {
+                            let key = std::str::from_utf8(attr.key.as_ref())?;
+                            let val = std::str::from_utf8(&attr.value)?;
+                            new_elem.push_attribute((key, val));
+                        }
+                    }
+                    writer.write_event(Event::Empty(new_elem))?;
+                } else {
+                    writer.write_event(Event::Empty(e.clone()))?;
+                }
+            }
+            Ok(Event::Start(ref e)) => {
+                let name_bytes = e.name().as_ref().to_vec();
+                if local_name(&name_bytes) == b"sldLayoutId" {
+                    let mut new_elem = BytesStart::new(
+                        std::str::from_utf8(e.name().as_ref())?.to_string()
+                    );
+                    for attr in e.attributes().flatten() {
+                        if attr.key.as_ref() == b"id" {
+                            new_elem.push_attribute(("id", next_id.to_string().as_str()));
+                            *next_id += 1;
+                        } else {
+                            let key = std::str::from_utf8(attr.key.as_ref())?;
+                            let val = std::str::from_utf8(&attr.value)?;
+                            new_elem.push_attribute((key, val));
+                        }
+                    }
+                    writer.write_event(Event::Start(new_elem))?;
+                } else {
+                    writer.write_event(Event::Start(e.clone()))?;
+                }
+            }
+            Ok(Event::Eof) => {
+                writer.write_event(Event::Eof)?;
+                break;
+            }
+            Ok(e) => {
+                writer.write_event(e)?;
+            }
+            Err(e) => return Err(anyhow::anyhow!("slideMaster XML処理エラー: {}", e)),
+        }
+        buf.clear();
+    }
+    Ok(writer.into_inner())
+}
+
 /// Add a content type override to [Content_Types].xml. Returns the modified XML.
 pub fn add_content_type_override(
     xml: &[u8],
