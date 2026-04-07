@@ -236,7 +236,7 @@ pub fn merge_pptx_files(input_files: &[impl AsRef<Path>], output: &Path) -> Resu
     }
 
     // Update docProps/app.xml with correct slide count
-    update_app_xml_slide_count(&mut archive)?;
+    update_app_xml(&mut archive)?;
 
     pptx::write_pptx(&archive, output)?;
     Ok(())
@@ -532,31 +532,137 @@ fn add_content_type(archive: &mut pptx::PptxArchive, part_name: &str, content_ty
     Ok(())
 }
 
-/// Update the slide count in docProps/app.xml to match actual number of slides.
-fn update_app_xml_slide_count(archive: &mut pptx::PptxArchive) -> Result<()> {
+/// Completely regenerate docProps/app.xml with correct metadata.
+fn update_app_xml(archive: &mut pptx::PptxArchive) -> Result<()> {
     let total_slides = archive.keys()
         .filter(|k| k.starts_with("ppt/slides/") && k.ends_with(".xml") && !k.contains("/_rels/"))
         .count();
 
+    let total_notes = archive.keys()
+        .filter(|k| k.starts_with("ppt/notesSlides/") && k.ends_with(".xml") && !k.contains("/_rels/"))
+        .count();
+
+    // Count themes and collect their names
+    let theme_files: Vec<String> = archive.keys()
+        .filter(|k| k.starts_with("ppt/theme/") && k.ends_with(".xml") && !k.contains("/_rels/"))
+        .cloned()
+        .collect();
+    let theme_count = theme_files.len();
+
+    // Build theme names from theme XML files
+    let mut theme_names: Vec<String> = Vec::new();
+    for tf in &theme_files {
+        if let Some(data) = archive.get(tf) {
+            let name = extract_theme_name(data).unwrap_or_else(|| "Office Theme".to_string());
+            theme_names.push(name);
+        }
+    }
+    if theme_names.is_empty() {
+        theme_names.push("Office Theme".to_string());
+    }
+
+    // Rebuild app.xml with correct values
     if let Some(app_xml) = archive.get("docProps/app.xml").cloned() {
-        let xml_str = String::from_utf8_lossy(&app_xml);
-        // Simple regex-like replacement for <Slides>N</Slides>
-        let updated = if let Some(start) = xml_str.find("<Slides>") {
-            if let Some(end) = xml_str[start..].find("</Slides>") {
-                let mut result = String::new();
-                result.push_str(&xml_str[..start]);
-                result.push_str(&format!("<Slides>{}</Slides>", total_slides));
-                result.push_str(&xml_str[start + end + "</Slides>".len()..]);
-                result
-            } else {
-                return Ok(());
-            }
-        } else {
-            return Ok(());
-        };
+        let xml_str = String::from_utf8_lossy(&app_xml).to_string();
+
+        let updated = xml_str
+            // Update Slides count
+            .replace_tag_value("Slides", &total_slides.to_string())
+            // Update Notes count
+            .replace_tag_value("Notes", &total_notes.to_string());
+
+        // Update HeadingPairs and TitlesOfParts for themes
+        let updated = update_heading_pairs_and_titles(&updated, theme_count, &theme_names, total_slides);
+
         archive.insert("docProps/app.xml".to_string(), updated.into_bytes());
     }
     Ok(())
+}
+
+fn extract_theme_name(theme_xml: &[u8]) -> Option<String> {
+    use quick_xml::events::Event;
+    use quick_xml::reader::Reader;
+
+    let mut reader = Reader::from_reader(theme_xml);
+    reader.config_mut().trim_text(true);
+    let mut buf = Vec::new();
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Start(ref e)) | Ok(Event::Empty(ref e)) => {
+                let name = e.name().as_ref().to_vec();
+                if local_name(&name) == b"theme" {
+                    for attr in e.attributes().flatten() {
+                        if attr.key.as_ref() == b"name" {
+                            return std::str::from_utf8(&attr.value).ok().map(|s| s.to_string());
+                        }
+                    }
+                }
+            }
+            Ok(Event::Eof) => break,
+            _ => {}
+        }
+        buf.clear();
+    }
+    None
+}
+
+trait ReplaceTagValue {
+    fn replace_tag_value(&self, tag: &str, value: &str) -> String;
+}
+
+impl ReplaceTagValue for String {
+    fn replace_tag_value(&self, tag: &str, value: &str) -> String {
+        let open = format!("<{}>", tag);
+        let close = format!("</{}>", tag);
+        if let Some(start) = self.find(&open) {
+            let after_open = start + open.len();
+            if let Some(end) = self[after_open..].find(&close) {
+                let mut result = String::new();
+                result.push_str(&self[..after_open]);
+                result.push_str(value);
+                result.push_str(&self[after_open + end..]);
+                return result;
+            }
+        }
+        self.clone()
+    }
+}
+
+fn update_heading_pairs_and_titles(xml: &str, theme_count: usize, theme_names: &[String], _slide_count: usize) -> String {
+    // Build new HeadingPairs section
+    let ns = "http://schemas.openxmlformats.org/officeDocument/2006/docPropsVTypes";
+    let titles_size = theme_count;
+
+    let heading_pairs = format!(
+        r#"<HeadingPairs><vt:vector size="4" baseType="variant"><vt:variant><vt:lpstr>Theme</vt:lpstr></vt:variant><vt:variant><vt:i4>{}</vt:i4></vt:variant><vt:variant><vt:lpstr>Slide Titles</vt:lpstr></vt:variant><vt:variant><vt:i4>0</vt:i4></vt:variant></vt:vector></HeadingPairs>"#,
+        theme_count
+    );
+
+    let theme_list: String = theme_names.iter()
+        .map(|n| format!("<vt:lpstr>{}</vt:lpstr>", n))
+        .collect::<Vec<_>>()
+        .join("");
+    let titles_of_parts = format!(
+        r#"<TitlesOfParts><vt:vector size="{}" baseType="lpstr">{}</vt:vector></TitlesOfParts>"#,
+        titles_size, theme_list
+    );
+
+    let mut result = xml.to_string();
+
+    // Replace HeadingPairs
+    if let (Some(start), Some(end)) = (result.find("<HeadingPairs>"), result.find("</HeadingPairs>")) {
+        let end = end + "</HeadingPairs>".len();
+        result = format!("{}{}{}", &result[..start], heading_pairs, &result[end..]);
+    }
+
+    // Replace TitlesOfParts
+    if let (Some(start), Some(end)) = (result.find("<TitlesOfParts>"), result.find("</TitlesOfParts>")) {
+        let end = end + "</TitlesOfParts>".len();
+        result = format!("{}{}{}", &result[..start], titles_of_parts, &result[end..]);
+    }
+
+    let _ = ns; // suppress warning
+    result
 }
 
 fn normalize_ppt_path(rel_target: &str, base: &str) -> String {
