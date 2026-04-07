@@ -186,15 +186,72 @@ impl PptxMargeApp {
 
         match merge::merge_pptx_files(&self.files, &output) {
             Ok(()) => {
+                // Try to clean up via python-pptx if available
+                let cleaned = self.try_python_cleanup(&output);
+                let extra = if cleaned { " (python-pptx正規化済み)" } else { "" };
                 self.status = Status::Success(format!(
-                    "結合が完了しました！ ({} ファイル → {})",
+                    "結合が完了しました！ ({} ファイル → {}){}",
                     self.files.len(),
-                    output.display()
+                    output.display(),
+                    extra
                 ));
             }
             Err(e) => {
                 self.status = Status::Error(format!("{:#}", e));
             }
         }
+    }
+
+    /// Try to run python-pptx cleanup on the merged file.
+    /// Returns true if cleanup was successful.
+    fn try_python_cleanup(&self, path: &std::path::Path) -> bool {
+        // Find cleanup.py next to the executable
+        let cleanup_script = std::env::current_exe()
+            .ok()
+            .and_then(|exe| exe.parent().map(|p| p.join("cleanup.py")))
+            .or_else(|| Some(std::path::PathBuf::from("cleanup.py")));
+
+        if let Some(script) = cleanup_script {
+            if script.exists() {
+                let temp = path.with_extension("tmp.pptx");
+                // Rename original to temp, run cleanup, replace
+                if std::fs::rename(path, &temp).is_ok() {
+                    let result = std::process::Command::new("python3")
+                        .args([
+                            script.to_str().unwrap_or("cleanup.py"),
+                            temp.to_str().unwrap_or(""),
+                            path.to_str().unwrap_or(""),
+                        ])
+                        .output();
+
+                    // Also try "python" (Windows)
+                    let result = if result.as_ref().map(|r| r.status.success()).unwrap_or(false) {
+                        result
+                    } else {
+                        std::process::Command::new("python")
+                            .args([
+                                script.to_str().unwrap_or("cleanup.py"),
+                                temp.to_str().unwrap_or(""),
+                                path.to_str().unwrap_or(""),
+                            ])
+                            .output()
+                    };
+
+                    let _ = std::fs::remove_file(&temp);
+
+                    if let Ok(output) = result {
+                        if output.status.success() && path.exists() {
+                            return true;
+                        }
+                    }
+
+                    // If cleanup failed, restore the original
+                    if !path.exists() {
+                        let _ = std::fs::rename(&temp, path);
+                    }
+                }
+            }
+        }
+        false
     }
 }
