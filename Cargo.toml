@@ -4,6 +4,14 @@ version = "0.1.0"
 edition = "2021"
 description = "PowerPointファイル結合ツール"
 
+[[bin]]
+name = "pptx-marge"
+path = "src/main.rs"
+
+[[bin]]
+name = "test-merge"
+path = "src/test_merge.rs"
+
 [dependencies]
 eframe = "0.31"
 rfd = "0.15"

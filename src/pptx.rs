@@ -121,6 +121,7 @@ pub struct Relationship {
     pub id: String,
     pub rel_type: String,
     pub target: String,
+    pub target_mode: Option<String>,
 }
 
 /// Parse a .rels XML file to extract relationships.
@@ -137,11 +138,13 @@ pub fn parse_rels(rels_xml: &[u8]) -> Result<Vec<Relationship>> {
                     let mut id = String::new();
                     let mut rel_type = String::new();
                     let mut target = String::new();
+                    let mut target_mode = None;
                     for attr in e.attributes().flatten() {
                         match attr.key.as_ref() {
                             b"Id" => id = std::str::from_utf8(&attr.value)?.to_string(),
                             b"Type" => rel_type = std::str::from_utf8(&attr.value)?.to_string(),
                             b"Target" => target = std::str::from_utf8(&attr.value)?.to_string(),
+                            b"TargetMode" => target_mode = Some(std::str::from_utf8(&attr.value)?.to_string()),
                             _ => {}
                         }
                     }
@@ -149,6 +152,7 @@ pub fn parse_rels(rels_xml: &[u8]) -> Result<Vec<Relationship>> {
                         id,
                         rel_type,
                         target,
+                        target_mode,
                     });
                 }
             }

@@ -232,7 +232,9 @@ fn pre_scan_resources(
         let context_dir = rels_context_dir(rels_path);
 
         for rel in &rels {
-            if rel.target.starts_with("http://") || rel.target.starts_with("https://") {
+            if rel.target.starts_with("http://") || rel.target.starts_with("https://")
+                || rel.target_mode.as_deref() == Some("External")
+            {
                 continue;
             }
 
@@ -304,11 +306,16 @@ fn copy_file_with_rels(
 
     if let Some(rels_data) = src.get(&src_rels_path) {
         let rels = pptx::parse_rels(rels_data)?;
-        let mut entries: Vec<(String, String, String)> = Vec::new();
+        let mut entries: Vec<RelEntry> = Vec::new();
 
         for rel in &rels {
             let new_target = remap_target(context_dir, &rel.target, path_remap, new_dir);
-            entries.push((rel.id.clone(), rel.rel_type.clone(), new_target));
+            entries.push(RelEntry {
+                id: rel.id.clone(),
+                rel_type: rel.rel_type.clone(),
+                target: new_target,
+                target_mode: rel.target_mode.clone(),
+            });
         }
 
         let new_rels_xml = build_rels_xml(&entries)?;
@@ -337,10 +344,15 @@ fn copy_file_with_rels(
 
                         if let Some(res_rels_data) = src.get(&res_rels_path) {
                             let res_rels = pptx::parse_rels(res_rels_data)?;
-                            let mut res_entries: Vec<(String, String, String)> = Vec::new();
+                            let mut res_entries: Vec<RelEntry> = Vec::new();
                             for r in &res_rels {
                                 let t = remap_target(res_src_dir, &r.target, path_remap, res_new_dir);
-                                res_entries.push((r.id.clone(), r.rel_type.clone(), t));
+                                res_entries.push(RelEntry {
+                                    id: r.id.clone(),
+                                    rel_type: r.rel_type.clone(),
+                                    target: t,
+                                    target_mode: r.target_mode.clone(),
+                                });
 
                                 // Copy sub-resources too
                                 if !r.target.starts_with("http") {
@@ -405,8 +417,15 @@ fn add_content_type_for_path(archive: &mut pptx::PptxArchive, path: &str) -> Res
     Ok(())
 }
 
-/// Build a .rels XML from a list of (Id, Type, Target) tuples.
-fn build_rels_xml(entries: &[(String, String, String)]) -> Result<Vec<u8>> {
+struct RelEntry {
+    id: String,
+    rel_type: String,
+    target: String,
+    target_mode: Option<String>,
+}
+
+/// Build a .rels XML from a list of RelEntry.
+fn build_rels_xml(entries: &[RelEntry]) -> Result<Vec<u8>> {
     use quick_xml::events::{BytesDecl, BytesStart, Event};
     use quick_xml::writer::Writer;
 
@@ -417,11 +436,14 @@ fn build_rels_xml(entries: &[(String, String, String)]) -> Result<Vec<u8>> {
     root.push_attribute(("xmlns", "http://schemas.openxmlformats.org/package/2006/relationships"));
     writer.write_event(Event::Start(root))?;
 
-    for (id, rel_type, target) in entries {
+    for entry in entries {
         let mut elem = BytesStart::new("Relationship");
-        elem.push_attribute(("Id", id.as_str()));
-        elem.push_attribute(("Type", rel_type.as_str()));
-        elem.push_attribute(("Target", target.as_str()));
+        elem.push_attribute(("Id", entry.id.as_str()));
+        elem.push_attribute(("Type", entry.rel_type.as_str()));
+        elem.push_attribute(("Target", entry.target.as_str()));
+        if let Some(mode) = &entry.target_mode {
+            elem.push_attribute(("TargetMode", mode.as_str()));
+        }
         writer.write_event(Event::Empty(elem))?;
     }
 
