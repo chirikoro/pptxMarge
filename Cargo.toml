@@ -1,0 +1,12 @@
+[package]
+name = "pptx-marge"
+version = "0.1.0"
+edition = "2021"
+description = "PowerPointファイル結合ツール"
+
+[dependencies]
+eframe = "0.31"
+rfd = "0.15"
+zip = "2"
+quick-xml = "0.37"
+anyhow = "1"
