@@ -237,7 +237,7 @@ impl PptxMargeApp {
         // Write Python script to temp directory
         let temp_dir = std::env::temp_dir();
         let script_path = temp_dir.join("pptx_marge_cleanup.py");
-        let script = format!(
+        let script =
 r#"import sys
 try:
     from pptx import Presentation
@@ -250,22 +250,50 @@ try:
 except Exception as e:
     sys.stderr.write("ERR:" + str(e))
     sys.exit(1)
-"#
-        );
+"#;
 
-        if std::fs::write(&script_path, &script).is_err() {
+        if std::fs::write(&script_path, script).is_err() {
             let _ = std::fs::rename(&temp_pptx, path);
             return CleanupResult::Failed("スクリプト書き込み失敗".to_string());
         }
 
-        let python_cmds = if cfg!(windows) {
-            vec!["python", "python3"]
+        // Build list of Python executables to try
+        let mut python_paths: Vec<std::path::PathBuf> = Vec::new();
+
+        // 1. pyenv on Windows: check user home directory
+        if cfg!(windows) {
+            if let Ok(home) = std::env::var("USERPROFILE") {
+                let pyenv_shim = std::path::PathBuf::from(&home)
+                    .join(".pyenv").join("pyenv-win").join("shims").join("python.exe");
+                if pyenv_shim.exists() {
+                    python_paths.push(pyenv_shim);
+                }
+                // Also check versions directory directly
+                let versions_dir = std::path::PathBuf::from(&home)
+                    .join(".pyenv").join("pyenv-win").join("versions");
+                if let Ok(entries) = std::fs::read_dir(&versions_dir) {
+                    for entry in entries.flatten() {
+                        let p = entry.path().join("python.exe");
+                        if p.exists() {
+                            python_paths.push(p);
+                        }
+                    }
+                }
+            }
+        }
+
+        // 2. Standard commands
+        if cfg!(windows) {
+            python_paths.push("py".into());
+            python_paths.push("python".into());
+            python_paths.push("python3".into());
         } else {
-            vec!["python3", "python"]
-        };
+            python_paths.push("python3".into());
+            python_paths.push("python".into());
+        }
 
         let mut last_err = String::new();
-        for cmd in &python_cmds {
+        for cmd in &python_paths {
             let result = std::process::Command::new(cmd)
                 .arg(script_path.to_str().unwrap_or(""))
                 .arg(temp_pptx.to_str().unwrap_or(""))
@@ -285,7 +313,7 @@ except Exception as e:
                         let _ = std::fs::remove_file(&script_path);
                         return CleanupResult::NoPython("pip install python-pptx を実行してください".to_string());
                     }
-                    last_err = format!("({}) {}", cmd, stderr);
+                    last_err = format!("({}) {}", cmd.display(), stderr);
                 }
                 Err(_) => continue,
             }
