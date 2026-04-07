@@ -227,34 +227,37 @@ impl PptxMargeApp {
 
     /// Try to run python-pptx cleanup on the merged file.
     fn try_python_cleanup(&self, path: &std::path::Path) -> CleanupResult {
-        let temp = path.with_extension("_tmp.pptx");
+        let temp_pptx = path.with_extension("_tmp.pptx");
 
         // Rename original to temp
-        if std::fs::rename(path, &temp).is_err() {
+        if std::fs::rename(path, &temp_pptx).is_err() {
             return CleanupResult::Failed("ファイルリネーム失敗".to_string());
         }
 
-        let src = temp.to_string_lossy().to_string();
-        let dst = path.to_string_lossy().to_string();
-
+        // Write Python script to temp directory
+        let temp_dir = std::env::temp_dir();
+        let script_path = temp_dir.join("pptx_marge_cleanup.py");
         let script = format!(
-            r#"import sys
+r#"import sys
 try:
     from pptx import Presentation
 except ImportError:
-    print("NO_PPTX",file=sys.stderr)
+    sys.stderr.write("NO_PPTX")
     sys.exit(2)
 try:
-    p=Presentation(r"{}")
-    p.save(r"{}")
+    p = Presentation(sys.argv[1])
+    p.save(sys.argv[2])
 except Exception as e:
-    print("ERR:"+str(e),file=sys.stderr)
+    sys.stderr.write("ERR:" + str(e))
     sys.exit(1)
-"#,
-            src, dst
+"#
         );
 
-        // Try python commands
+        if std::fs::write(&script_path, &script).is_err() {
+            let _ = std::fs::rename(&temp_pptx, path);
+            return CleanupResult::Failed("スクリプト書き込み失敗".to_string());
+        }
+
         let python_cmds = if cfg!(windows) {
             vec!["python", "python3"]
         } else {
@@ -263,38 +266,26 @@ except Exception as e:
 
         let mut last_err = String::new();
         for cmd in &python_cmds {
-            use std::process::Stdio;
-            use std::io::Write;
+            let result = std::process::Command::new(cmd)
+                .arg(script_path.to_str().unwrap_or(""))
+                .arg(temp_pptx.to_str().unwrap_or(""))
+                .arg(path.to_str().unwrap_or(""))
+                .output();
 
-            let child = std::process::Command::new(cmd)
-                .arg("-")
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn();
-
-            match child {
-                Ok(mut child) => {
-                    if let Some(mut stdin) = child.stdin.take() {
-                        let _ = stdin.write_all(script.as_bytes());
+            match result {
+                Ok(output) if output.status.success() && path.exists() => {
+                    let _ = std::fs::remove_file(&temp_pptx);
+                    let _ = std::fs::remove_file(&script_path);
+                    return CleanupResult::Success;
+                }
+                Ok(output) => {
+                    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+                    if stderr.contains("NO_PPTX") {
+                        let _ = std::fs::rename(&temp_pptx, path);
+                        let _ = std::fs::remove_file(&script_path);
+                        return CleanupResult::NoPython("pip install python-pptx を実行してください".to_string());
                     }
-                    match child.wait_with_output() {
-                        Ok(output) if output.status.success() && path.exists() => {
-                            let _ = std::fs::remove_file(&temp);
-                            return CleanupResult::Success;
-                        }
-                        Ok(output) => {
-                            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-                            if stderr.contains("NO_PPTX") {
-                                let _ = std::fs::rename(&temp, path);
-                                return CleanupResult::NoPython("pip install python-pptx を実行してください".to_string());
-                            }
-                            last_err = format!("{}: {}", cmd, stderr);
-                        }
-                        Err(e) => {
-                            last_err = format!("{} 実行エラー: {}", cmd, e);
-                        }
-                    }
+                    last_err = format!("({}) {}", cmd, stderr);
                 }
                 Err(_) => continue,
             }
@@ -302,10 +293,11 @@ except Exception as e:
 
         // Restore original on failure
         if !path.exists() {
-            let _ = std::fs::rename(&temp, path);
+            let _ = std::fs::rename(&temp_pptx, path);
         } else {
-            let _ = std::fs::remove_file(&temp);
+            let _ = std::fs::remove_file(&temp_pptx);
         }
+        let _ = std::fs::remove_file(&script_path);
 
         if last_err.is_empty() {
             CleanupResult::NoPython("Pythonが見つかりません".to_string())
