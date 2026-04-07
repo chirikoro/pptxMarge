@@ -271,6 +271,47 @@ pub fn add_relationship_to_rels(
     Ok(writer.into_inner())
 }
 
+/// Add a Default extension entry to [Content_Types].xml if it doesn't already exist.
+/// Returns the modified XML.
+pub fn add_content_type_default(
+    xml: &[u8],
+    extension: &str,
+    content_type: &str,
+) -> Result<Vec<u8>> {
+    // First check if this Default already exists
+    let (_, existing_defaults) = parse_content_types(xml)?;
+    if existing_defaults.contains_key(extension) {
+        return Ok(xml.to_vec());
+    }
+
+    let mut reader = Reader::from_reader(xml);
+    reader.config_mut().trim_text(false);
+    let mut writer = Writer::new(Vec::new());
+    let mut buf = Vec::new();
+
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::End(ref e)) if local_name(e.name().as_ref()) == b"Types" => {
+                let mut elem = BytesStart::new("Default");
+                elem.push_attribute(("Extension", extension));
+                elem.push_attribute(("ContentType", content_type));
+                writer.write_event(Event::Empty(elem))?;
+                writer.write_event(Event::End(e.clone()))?;
+            }
+            Ok(Event::Eof) => {
+                writer.write_event(Event::Eof)?;
+                break;
+            }
+            Ok(e) => {
+                writer.write_event(e)?;
+            }
+            Err(e) => return Err(anyhow::anyhow!("Content_Types XML処理エラー: {}", e)),
+        }
+        buf.clear();
+    }
+    Ok(writer.into_inner())
+}
+
 /// Add a content type override to [Content_Types].xml. Returns the modified XML.
 pub fn add_content_type_override(
     xml: &[u8],

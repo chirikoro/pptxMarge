@@ -109,6 +109,10 @@ pub fn merge_pptx_files(input_files: &[impl AsRef<Path>], output: &Path) -> Resu
         // Build content type map from source file
         let src_ct = ContentTypeMap::from_archive(&src)?;
 
+        // Copy Default extension entries from source to destination
+        // (e.g. .emf, .wmf, .svg, .tiff that might not exist in base)
+        merge_default_extensions(&src_ct, &mut archive)?;
+
         // === Phase 1: Build COMPLETE path_remap before copying anything ===
         let mut path_remap: HashMap<String, String> = HashMap::new();
 
@@ -301,9 +305,15 @@ fn pre_scan_resources(
                 let p = format!("ppt/diagrams/d{}_{}", counters.media, filename);
                 counters.media += 1;
                 p
+            } else if abs_path.starts_with("ppt/") {
+                // Generic fallback: preserve directory structure with unique prefix
+                let dir = abs_path.rsplit_once('/').map(|(d, _)| d).unwrap_or("ppt");
+                let filename = abs_path.rsplit('/').next().unwrap_or("file.bin");
+                let p = format!("{}/m{}_{}", dir, counters.media, filename);
+                counters.media += 1;
+                p
             } else {
-                // Generic fallback: keep in same directory structure with unique suffix
-                continue; // Skip unknown types to avoid breaking things
+                continue;
             };
 
             path_remap.insert(abs_path, new_path);
@@ -480,6 +490,19 @@ fn build_rels_xml(entries: &[RelEntry]) -> Result<Vec<u8>> {
 
     writer.write_event(Event::End(quick_xml::events::BytesEnd::new("Relationships")))?;
     Ok(writer.into_inner())
+}
+
+/// Copy all Default extension entries from source to destination.
+/// This ensures extensions like .emf, .wmf, .svg, .tiff are registered.
+fn merge_default_extensions(src_ct: &ContentTypeMap, dest: &mut pptx::PptxArchive) -> Result<()> {
+    for (ext, ct) in &src_ct.defaults {
+        let dest_ct_xml = dest.get("[Content_Types].xml")
+            .context("[Content_Types].xml が見つかりません")?
+            .clone();
+        let updated = pptx::add_content_type_default(&dest_ct_xml, ext, ct)?;
+        dest.insert("[Content_Types].xml".to_string(), updated);
+    }
+    Ok(())
 }
 
 fn add_content_type(archive: &mut pptx::PptxArchive, part_name: &str, content_type: &str) -> Result<()> {
