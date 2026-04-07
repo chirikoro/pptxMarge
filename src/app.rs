@@ -16,6 +16,12 @@ enum Status {
     Error(String),
 }
 
+enum CleanupResult {
+    Success,
+    NoPython(String),
+    Failed(String),
+}
+
 impl Default for PptxMargeApp {
     fn default() -> Self {
         Self {
@@ -187,14 +193,31 @@ impl PptxMargeApp {
         match merge::merge_pptx_files(&self.files, &output) {
             Ok(()) => {
                 // Try to clean up via python-pptx if available
-                let cleaned = self.try_python_cleanup(&output);
-                let extra = if cleaned { " (python-pptx正規化済み)" } else { "" };
-                self.status = Status::Success(format!(
-                    "結合が完了しました！ ({} ファイル → {}){}",
-                    self.files.len(),
-                    output.display(),
-                    extra
-                ));
+                match self.try_python_cleanup(&output) {
+                    CleanupResult::Success => {
+                        self.status = Status::Success(format!(
+                            "結合が完了しました！ ({} ファイル → {}) [python-pptx正規化済み]",
+                            self.files.len(),
+                            output.display(),
+                        ));
+                    }
+                    CleanupResult::NoPython(reason) => {
+                        self.status = Status::Success(format!(
+                            "結合が完了しました！ ({} ファイル → {})\n※ python-pptx正規化スキップ: {}",
+                            self.files.len(),
+                            output.display(),
+                            reason,
+                        ));
+                    }
+                    CleanupResult::Failed(err) => {
+                        self.status = Status::Success(format!(
+                            "結合が完了しました！ ({} ファイル → {})\n※ python-pptx正規化失敗: {}",
+                            self.files.len(),
+                            output.display(),
+                            err,
+                        ));
+                    }
+                }
             }
             Err(e) => {
                 self.status = Status::Error(format!("{:#}", e));
@@ -203,55 +226,86 @@ impl PptxMargeApp {
     }
 
     /// Try to run python-pptx cleanup on the merged file.
-    /// Returns true if cleanup was successful.
-    fn try_python_cleanup(&self, path: &std::path::Path) -> bool {
-        // Find cleanup.py next to the executable
-        let cleanup_script = std::env::current_exe()
-            .ok()
-            .and_then(|exe| exe.parent().map(|p| p.join("cleanup.py")))
-            .or_else(|| Some(std::path::PathBuf::from("cleanup.py")));
+    fn try_python_cleanup(&self, path: &std::path::Path) -> CleanupResult {
+        const SCRIPT: &str = r#"
+import sys
+try:
+    from pptx import Presentation
+except ImportError:
+    print("NO_PPTX", file=sys.stderr)
+    sys.exit(2)
+try:
+    prs = Presentation(sys.argv[1])
+    prs.save(sys.argv[2])
+except Exception as e:
+    print(f"ERROR: {e}", file=sys.stderr)
+    sys.exit(1)
+"#;
 
-        if let Some(script) = cleanup_script {
-            if script.exists() {
-                let temp = path.with_extension("tmp.pptx");
-                // Rename original to temp, run cleanup, replace
-                if std::fs::rename(path, &temp).is_ok() {
-                    let result = std::process::Command::new("python3")
-                        .args([
-                            script.to_str().unwrap_or("cleanup.py"),
-                            temp.to_str().unwrap_or(""),
-                            path.to_str().unwrap_or(""),
-                        ])
-                        .output();
+        // Write temp script
+        let script_path = path.with_extension("cleanup.py");
+        if std::fs::write(&script_path, SCRIPT).is_err() {
+            return CleanupResult::Failed("スクリプト書き込み失敗".to_string());
+        }
 
-                    // Also try "python" (Windows)
-                    let result = if result.as_ref().map(|r| r.status.success()).unwrap_or(false) {
-                        result
-                    } else {
-                        std::process::Command::new("python")
-                            .args([
-                                script.to_str().unwrap_or("cleanup.py"),
-                                temp.to_str().unwrap_or(""),
-                                path.to_str().unwrap_or(""),
-                            ])
-                            .output()
-                    };
+        let temp = path.with_extension("tmp.pptx");
 
+        // Try python commands (Windows: "python", Linux/Mac: "python3")
+        let python_cmds = if cfg!(windows) {
+            vec!["python", "python3"]
+        } else {
+            vec!["python3", "python"]
+        };
+
+        // Rename original to temp
+        if std::fs::rename(path, &temp).is_err() {
+            let _ = std::fs::remove_file(&script_path);
+            return CleanupResult::Failed("ファイルリネーム失敗".to_string());
+        }
+
+        let mut last_err = String::new();
+        for cmd in &python_cmds {
+            let result = std::process::Command::new(cmd)
+                .args([
+                    script_path.to_str().unwrap_or(""),
+                    temp.to_str().unwrap_or(""),
+                    path.to_str().unwrap_or(""),
+                ])
+                .output();
+
+            match result {
+                Ok(output) if output.status.success() && path.exists() => {
                     let _ = std::fs::remove_file(&temp);
-
-                    if let Ok(output) = result {
-                        if output.status.success() && path.exists() {
-                            return true;
-                        }
-                    }
-
-                    // If cleanup failed, restore the original
-                    if !path.exists() {
+                    let _ = std::fs::remove_file(&script_path);
+                    return CleanupResult::Success;
+                }
+                Ok(output) => {
+                    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+                    if stderr.contains("NO_PPTX") {
+                        // Restore original
                         let _ = std::fs::rename(&temp, path);
+                        let _ = std::fs::remove_file(&script_path);
+                        return CleanupResult::NoPython("pip install python-pptx を実行してください".to_string());
                     }
+                    last_err = stderr;
+                }
+                Err(e) => {
+                    last_err = format!("{} が見つかりません: {}", cmd, e);
                 }
             }
         }
-        false
+
+        // Restore original on failure
+        if !path.exists() {
+            let _ = std::fs::rename(&temp, path);
+        }
+        let _ = std::fs::remove_file(&temp);
+        let _ = std::fs::remove_file(&script_path);
+
+        if last_err.contains("が見つかりません") {
+            CleanupResult::NoPython("Pythonが見つかりません".to_string())
+        } else {
+            CleanupResult::Failed(last_err)
+        }
     }
 }
