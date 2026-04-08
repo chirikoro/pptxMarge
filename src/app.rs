@@ -293,6 +293,61 @@ except Exception as e:
         }
 
         let mut last_err = String::new();
+
+        // On Windows, use "cmd /c python" to resolve pyenv shims correctly
+        // (GUI apps don't go through cmd.exe so shims don't work directly)
+        if cfg!(windows) {
+            for py in &["python", "python3", "py"] {
+                let result = std::process::Command::new("cmd")
+                    .arg("/c")
+                    .arg(py)
+                    .arg(script_path.to_str().unwrap_or(""))
+                    .arg(temp_pptx.to_str().unwrap_or(""))
+                    .arg(path.to_str().unwrap_or(""))
+                    .output();
+
+                match result {
+                    Ok(output) if output.status.success() && path.exists() => {
+                        let _ = std::fs::remove_file(&temp_pptx);
+                        let _ = std::fs::remove_file(&script_path);
+                        return CleanupResult::Success;
+                    }
+                    Ok(output) => {
+                        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+                        if stderr.contains("NO_PPTX") {
+                            let _ = std::fs::rename(&temp_pptx, path);
+                            let _ = std::fs::remove_file(&script_path);
+                            return CleanupResult::NoPython("pip install python-pptx を実行してください".to_string());
+                        }
+                        if !stderr.is_empty() {
+                            last_err = format!("(cmd /c {}) {}", py, stderr);
+                        }
+                    }
+                    Err(_) => continue,
+                }
+            }
+        }
+
+        // Direct execution (Linux/Mac, or fallback on Windows)
+        // Also try pyenv paths on Windows
+        let mut python_paths: Vec<std::path::PathBuf> = Vec::new();
+        if cfg!(windows) {
+            if let Ok(home) = std::env::var("USERPROFILE") {
+                let versions_dir = std::path::PathBuf::from(&home)
+                    .join(".pyenv").join("pyenv-win").join("versions");
+                if let Ok(entries) = std::fs::read_dir(&versions_dir) {
+                    for entry in entries.flatten() {
+                        let p = entry.path().join("python.exe");
+                        if p.exists() {
+                            python_paths.push(p);
+                        }
+                    }
+                }
+            }
+        }
+        python_paths.push("python3".into());
+        python_paths.push("python".into());
+
         for cmd in &python_paths {
             let result = std::process::Command::new(cmd)
                 .arg(script_path.to_str().unwrap_or(""))
