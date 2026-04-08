@@ -3,6 +3,7 @@ name = "pptx-marge"
 version = "0.1.0"
 edition = "2021"
 description = "PowerPointファイル結合ツール"
+build = "build.rs"
 
 [dependencies]
 eframe = "0.31"
@@ -10,3 +11,7 @@ rfd = "0.15"
 zip = { version = "2", default-features = false, features = ["deflate"] }
 quick-xml = "0.37"
 anyhow = "1"
+image = { version = "0.25", default-features = false, features = ["png"] }
+
+[build-dependencies]
+winresource = "0.1"

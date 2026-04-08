@@ -5,10 +5,18 @@ mod merge;
 mod pptx;
 
 fn main() -> eframe::Result {
+    let icon = load_icon();
+
+    let mut viewport = eframe::egui::ViewportBuilder::default()
+        .with_inner_size([600.0, 500.0])
+        .with_min_inner_size([400.0, 300.0]);
+
+    if let Some(icon_data) = icon {
+        viewport = viewport.with_icon(icon_data);
+    }
+
     let options = eframe::NativeOptions {
-        viewport: eframe::egui::ViewportBuilder::default()
-            .with_inner_size([600.0, 500.0])
-            .with_min_inner_size([400.0, 300.0]),
+        viewport,
         ..Default::default()
     };
     eframe::run_native(
@@ -21,10 +29,35 @@ fn main() -> eframe::Result {
     )
 }
 
+/// Load icon.png from next to the executable or current directory.
+fn load_icon() -> Option<eframe::egui::IconData> {
+    let icon_bytes = find_and_read_icon()?;
+    let img = image::load_from_memory(&icon_bytes).ok()?.into_rgba8();
+    let (w, h) = img.dimensions();
+    Some(eframe::egui::IconData {
+        rgba: img.into_raw(),
+        width: w,
+        height: h,
+    })
+}
+
+fn find_and_read_icon() -> Option<Vec<u8>> {
+    // Check next to executable
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let p = dir.join("icon.png");
+            if let Ok(data) = std::fs::read(&p) {
+                return Some(data);
+            }
+        }
+    }
+    // Check current directory
+    std::fs::read("icon.png").ok()
+}
+
 fn configure_fonts(ctx: &eframe::egui::Context) {
     let mut fonts = eframe::egui::FontDefinitions::default();
 
-    // Try to load a Japanese font from the system
     let font_paths = [
         "/usr/share/fonts/opentype/ipafont-gothic/ipagp.ttf",
         "/usr/share/fonts/opentype/ipafont-gothic/ipag.ttf",
@@ -44,7 +77,6 @@ fn configure_fonts(ctx: &eframe::egui::Context) {
                 "japanese_font".to_string(),
                 eframe::egui::FontData::from_owned(font_data).into(),
             );
-            // Add Japanese font as fallback for proportional and monospace
             if let Some(family) = fonts
                 .families
                 .get_mut(&eframe::egui::FontFamily::Proportional)
