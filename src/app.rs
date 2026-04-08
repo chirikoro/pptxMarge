@@ -190,38 +190,102 @@ impl PptxMargeApp {
             None => return,
         };
 
+        // First try PowerPoint COM merge (most reliable on Windows)
+        if cfg!(windows) {
+            match self.try_powerpoint_merge(&output) {
+                CleanupResult::Success => {
+                    self.status = Status::Success(format!(
+                        "結合が完了しました！ ({} ファイル → {}) [PowerPoint経由]",
+                        self.files.len(),
+                        output.display(),
+                    ));
+                    return;
+                }
+                CleanupResult::NoPython(reason) => {
+                    // PowerPoint not available, fall through to Rust merge
+                    let _ = reason;
+                }
+                CleanupResult::Failed(err) => {
+                    let _ = err;
+                }
+            }
+        }
+
+        // Fallback: Rust merge + python-pptx cleanup
         match merge::merge_pptx_files(&self.files, &output) {
             Ok(()) => {
-                // Try to clean up via python-pptx if available
-                match self.try_python_cleanup(&output) {
-                    CleanupResult::Success => {
-                        self.status = Status::Success(format!(
-                            "結合が完了しました！ ({} ファイル → {}) [python-pptx正規化済み]",
-                            self.files.len(),
-                            output.display(),
-                        ));
-                    }
-                    CleanupResult::NoPython(reason) => {
-                        self.status = Status::Success(format!(
-                            "結合が完了しました！ ({} ファイル → {})\n※ python-pptx正規化スキップ: {}",
-                            self.files.len(),
-                            output.display(),
-                            reason,
-                        ));
-                    }
-                    CleanupResult::Failed(err) => {
-                        self.status = Status::Success(format!(
-                            "結合が完了しました！ ({} ファイル → {})\n※ python-pptx正規化失敗: {}",
-                            self.files.len(),
-                            output.display(),
-                            err,
-                        ));
-                    }
-                }
+                let cleaned = matches!(self.try_python_cleanup(&output), CleanupResult::Success);
+                let extra = if cleaned { " [python-pptx正規化済み]" } else { "" };
+                self.status = Status::Success(format!(
+                    "結合が完了しました！ ({} ファイル → {}){}",
+                    self.files.len(),
+                    output.display(),
+                    extra,
+                ));
             }
             Err(e) => {
                 self.status = Status::Error(format!("{:#}", e));
             }
+        }
+    }
+
+    /// Merge using PowerPoint COM via PowerShell (Windows only, most reliable).
+    fn try_powerpoint_merge(&self, output: &std::path::Path) -> CleanupResult {
+        if self.files.len() < 2 {
+            return CleanupResult::Failed("ファイル不足".to_string());
+        }
+
+        // Build PowerShell script
+        let mut ps_script = String::new();
+        ps_script.push_str("$ErrorActionPreference = 'Stop'\n");
+        ps_script.push_str("try {\n");
+        ps_script.push_str("  $ppt = New-Object -ComObject PowerPoint.Application\n");
+        ps_script.push_str(&format!(
+            "  $pres = $ppt.Presentations.Open('{}',[System.Convert]::ToInt32($true),[System.Convert]::ToInt32($true),[System.Convert]::ToInt32($true))\n",
+            self.files[0].to_string_lossy().replace('\'', "''")
+        ));
+
+        for file in &self.files[1..] {
+            ps_script.push_str(&format!(
+                "  $pres.Slides.InsertFromFile('{}', $pres.Slides.Count)\n",
+                file.to_string_lossy().replace('\'', "''")
+            ));
+        }
+
+        ps_script.push_str(&format!(
+            "  $pres.SaveAs('{}')\n",
+            output.to_string_lossy().replace('\'', "''")
+        ));
+        ps_script.push_str("  $pres.Close()\n");
+        ps_script.push_str("  $ppt.Quit()\n");
+        ps_script.push_str("  [System.Runtime.InteropServices.Marshal]::ReleaseComObject($pres) | Out-Null\n");
+        ps_script.push_str("  [System.Runtime.InteropServices.Marshal]::ReleaseComObject($ppt) | Out-Null\n");
+        ps_script.push_str("} catch {\n");
+        ps_script.push_str("  Write-Error $_.Exception.Message\n");
+        ps_script.push_str("  exit 1\n");
+        ps_script.push_str("}\n");
+
+        let result = std::process::Command::new("powershell")
+            .arg("-NoProfile")
+            .arg("-ExecutionPolicy")
+            .arg("Bypass")
+            .arg("-Command")
+            .arg(&ps_script)
+            .output();
+
+        match result {
+            Ok(out) if out.status.success() && output.exists() => {
+                CleanupResult::Success
+            }
+            Ok(out) => {
+                let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+                if stderr.contains("PowerPoint.Application") || stderr.contains("ComObject") {
+                    CleanupResult::NoPython("PowerPointがインストールされていません".to_string())
+                } else {
+                    CleanupResult::Failed(format!("PowerShell: {}", stderr))
+                }
+            }
+            Err(_) => CleanupResult::NoPython("PowerShellが見つかりません".to_string()),
         }
     }
 
